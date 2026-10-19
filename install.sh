@@ -130,8 +130,11 @@ runuser -u vortex-build -- env PATH=/var/cache/vortex-node-build/cargo/bin:/usr/
 RELEASE="$ROOT/releases/$COMMIT"
 install -d -m 755 "$RELEASE"
 install -m 755 /var/cache/vortex-node-build/target/release/vortex-node "$RELEASE/vortex-node"
-install -m 755 "$SOURCE/install.sh" "$ROOT/install.sh"
-install -m 755 "$SOURCE/uninstall.sh" "$ROOT/uninstall.sh"
+# Atomic replacement also makes running the installed updater safe.
+install -m 755 "$SOURCE/install.sh" "$ROOT/install.sh.new"
+mv -f "$ROOT/install.sh.new" "$ROOT/install.sh"
+install -m 755 "$SOURCE/uninstall.sh" "$ROOT/uninstall.sh.new"
+mv -f "$ROOT/uninstall.sh.new" "$ROOT/uninstall.sh"
 
 # Pull the public Vault HTML; the supplied 2.3 HTML is the compatible fallback.
 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 'https://raw.githubusercontent.com/MagnetosphereLabs/VortexVault/main/Vortex%20Vault.html' -o "$WORK/vault.html" || true
@@ -186,7 +189,8 @@ Backlog=128
 [Install]
 WantedBy=sockets.target
 EOF
-cat > /etc/systemd/system/vortex-node.service <<'EOF'
+CPU_BUDGET=$(( $(nproc) * 70 ))
+cat > /etc/systemd/system/vortex-node.service <<EOF
 [Unit]
 Description=Vortex Node encrypted storage and relay
 Requires=vortex-node.socket
@@ -214,7 +218,9 @@ CapabilityBoundingSet=
 ReadWritePaths=/var/lib/vortex-node
 LimitNOFILE=4096
 TasksMax=128
-MemoryMax=1G
+CPUQuota=$CPU_BUDGET%
+MemoryHigh=60%
+MemoryMax=70%
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -310,3 +316,4 @@ echo "Vortex Node is ready: https://$DOMAIN"
 echo "Vortex Vault:         https://$DOMAIN/vault/"
 echo 'Manual update:       sudo /opt/vortex-node/install.sh update'
 echo 'Uninstall:           sudo /opt/vortex-node/uninstall.sh'
+
