@@ -1891,8 +1891,20 @@ fn setup(path: &Path, stdin_user: Option<&str>) -> Result<()> {
     println!("Node account saved. Existing sessions for this account were revoked.");
     Ok(())
 }
-#[tokio::main]
-async fn main() -> Result<()> {
+fn worker_budget() -> usize {
+    // Leave CPU capacity for Nginx, SSH and other services on the host.
+    let cores = std::thread::available_parallelism().map(usize::from).unwrap_or(1);
+    cores.saturating_mul(7).div_ceil(10).clamp(1, 32)
+}
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_budget())
+        .max_blocking_threads(32)
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+async fn run() -> Result<()> {
     #[cfg(unix)]
     unsafe {
         libc::umask(0o077);
@@ -2085,3 +2097,4 @@ mod tests {
         assert_eq!(latest, 7);
     }
 }
+
