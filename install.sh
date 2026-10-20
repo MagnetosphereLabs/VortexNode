@@ -26,6 +26,8 @@ SUCCESS=0
 CHANGED_SITE=0
 HAD_SITE=0
 OLD_RELEASE=""
+STOPPED=0
+PUBLISHED=0
 if [[ -L "$ROOT/current" ]]; then OLD_RELEASE=$(readlink -f "$ROOT/current"); fi
 finish() {
   local code=$?
@@ -35,10 +37,14 @@ finish() {
       if [[ $HAD_SITE == 1 ]]; then cp "$WORK/prior-nginx.conf" "$SITE"; else rm -f "$SITE"; fi
       nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
     fi
-    if [[ -n "$OLD_RELEASE" && -d "$OLD_RELEASE" ]]; then
+    if [[ $PUBLISHED == 0 && -n "$OLD_RELEASE" && -d "$OLD_RELEASE" ]]; then
       ln -sfn "$OLD_RELEASE" "$ROOT/current.restore"
       mv -Tf "$ROOT/current.restore" "$ROOT/current"
+      systemctl start vortex-node.socket || true
       systemctl restart vortex-node.service || true
+    fi
+    if [[ $PUBLISHED == 1 ]]; then
+      echo 'The new release remains selected to protect the current encrypted format. Review journalctl -u vortex-node before retrying the update.' >&2
     fi
   fi
   rm -rf -- "$WORK"
@@ -136,14 +142,10 @@ mv -f "$ROOT/install.sh.new" "$ROOT/install.sh"
 install -m 755 "$SOURCE/uninstall.sh" "$ROOT/uninstall.sh.new"
 mv -f "$ROOT/uninstall.sh.new" "$ROOT/uninstall.sh"
 
-# Pull the public Vault HTML; the supplied 2.3 HTML is the compatible fallback.
-curl --proto '=https' --tlsv1.2 -fsSL --retry 3 'https://raw.githubusercontent.com/MagnetosphereLabs/VortexVault/main/Vortex%20Vault.html' -o "$WORK/vault.html" || true
-if [[ ! -s "$WORK/vault.html" ]] || ! grep -q 'id="vortexSessionAdapter"' "$WORK/vault.html"; then
-  if [[ -f "$WORK/source/Vortex Vault.html" ]]; then cp "$WORK/source/Vortex Vault.html" "$WORK/vault.html"
-  elif [[ -f "$SOURCE/Vortex Vault.html" ]]; then cp "$SOURCE/Vortex Vault.html" "$WORK/vault.html"
-  else echo 'Publish the supplied Vortex Vault 2.3 HTML to the Vault repository or include it beside this installer.' >&2; exit 1; fi
-fi
-grep -q 'id="vortexSessionAdapter"' "$WORK/vault.html" || { echo 'The downloaded Vault is not Node-compatible.' >&2; exit 1; }
+# Backend and frontend always come from the same checked-out Node commit.
+[[ -f "$SOURCE/Vortex Vault.html" ]] || { echo 'This Node release is missing its bundled Vortex Vault.html.' >&2; exit 1; }
+cp "$SOURCE/Vortex Vault.html" "$WORK/vault.html"
+grep -q 'id="vortexPagedStorage"' "$WORK/vault.html" || { echo 'The bundled Vault does not support this Node storage format.' >&2; exit 1; }
 install -m 644 "$WORK/vault.html" "$RELEASE/vault.html"
 if [[ "$ACTION" == update && -f "$DATA/node.sqlite" ]]; then
   # Do not kill an active seven-hour delivery during an application update.
@@ -152,7 +154,18 @@ import sqlite3,sys,time
 c=sqlite3.connect(sys.argv[1]);t=int(time.time())
 active=c.execute("SELECT COUNT(*) FROM shares WHERE (state='uploading' AND created>?) OR (state='ready' AND expires>?) OR (state='receiving' AND deadline>?)",(t-86400,t,t)).fetchone()[0]
 assert active==0,'A delivery is active. Finish or revoke it in Vault Settings before updating.'
+if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='object_jobs'").fetchone():
+ assert c.execute("SELECT COUNT(*) FROM object_jobs WHERE deadline>?",(t,)).fetchone()[0]==0,'An encrypted save is active. Let it finish before updating.'
 PY
+  systemctl stop vortex-node.socket vortex-node.service
+  STOPPED=1
+  runuser -u vortex-node -- python3 - "$DATA/node.sqlite" <<'PY_FINAL'
+import sqlite3,sys,time
+c=sqlite3.connect(sys.argv[1]);t=int(time.time())
+assert c.execute("SELECT COUNT(*) FROM shares WHERE (state='uploading' AND created>?) OR (state='ready' AND expires>?) OR (state='receiving' AND deadline>?)",(t-86400,t,t)).fetchone()[0]==0,'A delivery started during the update. Retry after it finishes.'
+if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='object_jobs'").fetchone():
+ assert c.execute("SELECT COUNT(*) FROM object_jobs WHERE deadline>?",(t,)).fetchone()[0]==0,'An encrypted save started during the update. Let it finish and retry.'
+PY_FINAL
   runuser -u vortex-node -- python3 - "$DATA/node.sqlite" "$DATA/update-backup.sqlite" <<'PY'
 import sqlite3,sys
 with sqlite3.connect(sys.argv[1]) as source,sqlite3.connect(sys.argv[2]) as dest:source.backup(dest)
@@ -190,6 +203,20 @@ Backlog=128
 WantedBy=sockets.target
 EOF
 CPU_BUDGET=$(( $(nproc) * 70 ))
+read -r MEMORY_HIGH MEMORY_MAX < <(python3 - <<'PY_MEMORY'
+from pathlib import Path
+ram=int(next(x.split()[1] for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemTotal:')))*1024
+# Honour an enclosing cgroup instead of assuming all host RAM is available.
+for path in ('/sys/fs/cgroup/memory.max','/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+ try:
+  value=Path(path).read_text().strip()
+  if value!='max':ram=min(ram,int(value))
+ except (OSError,ValueError):pass
+gib=1024**3
+limit=min(ram*7//10,ram-2*gib) if ram>=4*gib else ram*7//10
+print(limit*85//100,limit)
+PY_MEMORY
+)
 cat > /etc/systemd/system/vortex-node.service <<EOF
 [Unit]
 Description=Vortex Node encrypted storage and relay
@@ -219,8 +246,9 @@ ReadWritePaths=/var/lib/vortex-node
 LimitNOFILE=4096
 TasksMax=128
 CPUQuota=$CPU_BUDGET%
-MemoryHigh=60%
-MemoryMax=70%
+MemoryHigh=$MEMORY_HIGH
+MemoryMax=$MEMORY_MAX
+MemorySwapMax=0
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -303,6 +331,7 @@ fi
 systemctl daemon-reload
 systemctl enable --now vortex-node.socket
 systemctl enable vortex-node.service
+PUBLISHED=1
 systemctl restart vortex-node.service
 systemctl reload nginx
 for attempt in $(seq 1 30); do
