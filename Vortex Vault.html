@@ -14429,6 +14429,14 @@ window.VortexSession=(()=>{
 </script>
 <style id="vortexRefinementStyles">
 /* Precise compact controls and complete, readable connection states. */
+/* Seven workspaces, including Chat, share one compact icon row. */
+@media(max-width:760px){
+ #workspaceBar .workspaceTabs{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));width:100%;min-width:0;gap:3px}
+ #workspaceBar .workspaceTab{min-width:0;width:100%;padding:0;gap:0;flex:none;box-sizing:border-box}
+ #workspaceBar .workspaceTab>span:not(.workspaceTabIcon){display:none}
+ #workspaceBar .workspaceTabIcon{flex:0 0 17px}
+}
+
 header .controls #btnGuide{display:inline-flex!important;align-items:center!important;justify-content:center!important}
 @media(max-width:1100px){.vortexPaired header .controls #btnGuide .vvBtnLabel{display:none}}
 header .controls #btnNewVault{justify-content:center}
