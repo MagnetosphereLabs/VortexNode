@@ -172,9 +172,16 @@ fn directory(c: &Connection) -> Api<Value> {
     let rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"username":r.get::<_,String>(1)?,"display":r.get::<_,String>(2)?,"identity":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(Value::Null),"profile":!r.get::<_,String>(4)?.is_empty(),"status":r.get::<_,String>(5)?,"created":r.get::<_,i64>(6)?,"owner":r.get::<_,bool>(7)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     Ok(json!(rows))
 }
+// Only public signing/exchange keys survive account deletion, so shared history
+// and conversation key signatures remain verifiable. No login or profile remains.
+fn former_users(c: &Connection) -> Api<Value> {
+    let mut q = c.prepare("SELECT id,identity,devices FROM chat_deleted_users")?;
+    let rows = q.query_map([], |r| Ok(json!({"id":r.get::<_,String>(0)?,"identity":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap_or(Value::Null),"devices":serde_json::from_str::<Value>(&r.get::<_,String>(2)?).unwrap_or(json!([])),"username":"deleted","display":"Deleted account","status":"offline","deleted":true})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    Ok(json!(rows))
+}
 fn active_now(c: &Connection, user: &str) -> Api<bool> {
     Ok(c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM chat_activity WHERE user=? AND at>? AND idle=0)",
+        "SELECT EXISTS(SELECT 1 FROM chat_activity WHERE user=? AND at>? AND idle=0 AND viewing=1)",
         params![user, now() - 45],
         |r| r.get(0),
     )?)
@@ -240,8 +247,12 @@ pub fn initialize(c: &Connection) -> Result<()> {
  CREATE INDEX IF NOT EXISTS chat_event_sender ON chat_events(sender);
  CREATE INDEX IF NOT EXISTS chat_room_space ON chat_rooms(space);
  CREATE TABLE IF NOT EXISTS chat_friends(user TEXT NOT NULL,other TEXT NOT NULL,status TEXT NOT NULL,PRIMARY KEY(user,other));
+ CREATE TABLE IF NOT EXISTS chat_deleted_users(id TEXT PRIMARY KEY,identity TEXT NOT NULL,devices TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS chat_totp(user TEXT PRIMARY KEY,seed TEXT NOT NULL,expires INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS chat_recovery(user TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(user,hash));")?;
+    if c.prepare("SELECT viewing FROM chat_activity LIMIT 0").is_err() {
+        c.execute_batch("ALTER TABLE chat_activity ADD COLUMN viewing INTEGER NOT NULL DEFAULT 1")?;
+    }
     if !c.prepare("SELECT quota FROM chat_spaces LIMIT 0").is_ok() {
         c.execute(
             "ALTER TABLE chat_spaces ADD COLUMN quota INTEGER NOT NULL DEFAULT 107374182400",
@@ -356,6 +367,14 @@ pub async fn action(
     } else {
         None
     };
+    let deleted_user = if name == "admin.user.delete" { Some(text(&v, "user")) } else { None };
+    let deleted_rooms = if let Some(target) = &deleted_user {
+        owner(&user(&a, &h)?)?;
+        let c = db(&a)?;
+        let mut q = c.prepare("SELECT room FROM chat_members WHERE user=?")?;
+        let rows = q.query_map([target], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        rows
+    } else { Vec::new() };
     let work = a.clone();
     let out = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -365,6 +384,9 @@ pub async fn action(
     .map_err(|_| Fault(StatusCode::INTERNAL_SERVER_ERROR, "Chat operation failed"))??;
     if let Some(target) = kick {
         kick_media(&a, &room, &target).await;
+    }
+    if let Some(target) = deleted_user {
+        for room in deleted_rooms { kick_media(&a, &room, &target).await; }
     }
     if changed {
         let _ = a.chat_events.send(room);
@@ -716,7 +738,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
             Ok(
-                json!({"id":u.id,"owner":u.owner,"canInvite":u.owner || c.query_row("SELECT can_invite FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"canSpace":u.owner || c.query_row("SELECT can_space FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"username":name,"bundle":bundle,"identity":serde_json::from_str::<Value>(&identity).unwrap_or(Value::Null),"totp":!totp.is_empty(),"policy":setting(&c,"policy")?,"users":directory(&c)?,"media":a.cfg.media.is_some(),"months":c.query_row("SELECT months FROM chat_login_policy WHERE user=?",[&u.id],|r|r.get::<_,i64>(0)).optional()?.unwrap_or(12),"preferences":c.query_row("SELECT body FROM chat_preferences WHERE user=?",[&u.id],|r|r.get::<_,String>(0)).optional()?.unwrap_or_default()}),
+                json!({"id":u.id,"owner":u.owner,"canInvite":u.owner || c.query_row("SELECT can_invite FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"canSpace":u.owner || c.query_row("SELECT can_space FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"username":name,"bundle":bundle,"identity":serde_json::from_str::<Value>(&identity).unwrap_or(Value::Null),"totp":!totp.is_empty(),"policy":setting(&c,"policy")?,"users":directory(&c)?,"formerUsers":former_users(&c)?,"media":a.cfg.media.is_some(),"months":c.query_row("SELECT months FROM chat_login_policy WHERE user=?",[&u.id],|r|r.get::<_,i64>(0)).optional()?.unwrap_or(12),"preferences":c.query_row("SELECT body FROM chat_preferences WHERE user=?",[&u.id],|r|r.get::<_,String>(0)).optional()?.unwrap_or_default()}),
             )
         }
         "logout" => {
@@ -790,7 +812,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             Ok(json!({"ok":true}))
         }
         "devices" => Ok(json!({"devices":devices(&c,&text(&v,"user"))?})),
-        "directory" => Ok(json!({"users":directory(&c)?})),
+        "directory" => Ok(json!({"users":directory(&c)?,"formerUsers":former_users(&c)?})),
         "session.months" => {
             let months = v["months"].as_u64().unwrap_or(12);
             if !(1..=12).contains(&months) {
@@ -825,13 +847,14 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
         "admin.users" => {
             owner(&u)?;
             let mut q = c.prepare(
-                "SELECT id,can_invite,can_space,disabled,quota,username,display FROM chat_users",
+                "SELECT id,can_invite,can_space,disabled,quota,username,display,node_owner IS NOT NULL FROM chat_users",
             )?;
-            let users=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"invite":r.get::<_,bool>(1)?,"spaces":r.get::<_,bool>(2)?,"disabled":r.get::<_,bool>(3)?,"quota":r.get::<_,i64>(4)?,"username":r.get::<_,String>(5)?,"display":r.get::<_,String>(6)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            let users=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"invite":r.get::<_,bool>(1)?,"spaces":r.get::<_,bool>(2)?,"disabled":r.get::<_,bool>(3)?,"quota":r.get::<_,i64>(4)?,"username":r.get::<_,String>(5)?,"display":r.get::<_,String>(6)?,"owner":r.get::<_,bool>(7)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
             Ok(json!({"users":users}))
         }
         "profile.get" => {
             let target = text(&v, "user");
+            if c.query_row("SELECT EXISTS(SELECT 1 FROM chat_deleted_users WHERE id=?)", [&target], |r| r.get::<_, bool>(0))? { return Ok(json!({"profile":""})); }
             let value: String = c.query_row(
                 "SELECT profile FROM chat_users WHERE id=? AND disabled=0",
                 [target],
@@ -886,9 +909,10 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             Ok(json!({"ok":true}))
         }
         "friends" => {
-            let mut q =
-                c.prepare("SELECT user,other,status FROM chat_friends WHERE user=? OR other=?")?;
-            let rows=q.query_map(params![u.id,u.id],|r|Ok(json!({"user":r.get::<_,String>(0)?,"other":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            // Accepted friendships have reciprocal rows. Return one visible
+            // relationship per person; another user's block is private.
+            let mut q = c.prepare("SELECT f.user,f.other,f.status FROM chat_friends f JOIN chat_users person ON person.id=CASE WHEN f.user=?1 THEN f.other ELSE f.user END WHERE person.disabled=0 AND (f.user=?1 OR (f.other=?1 AND f.status!='blocked' AND NOT EXISTS(SELECT 1 FROM chat_friends own WHERE own.user=?1 AND own.other=f.user))) ORDER BY person.username")?;
+            let rows=q.query_map([&u.id],|r|Ok(json!({"user":r.get::<_,String>(0)?,"other":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
             Ok(json!({"friends":rows}))
         }
         "room.init" => {
@@ -946,7 +970,8 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
         }
         "room.rekey" => {
             let room = text(&v, "room");
-            room_permission(&c, &u, &room, 2)?;
+            let deleted_member: bool = c.query_row("SELECT needs_rekey=2 FROM chat_rooms WHERE id=?", [&room], |r| r.get(0))?;
+            if deleted_member { member(&c, &u, &room)?; } else { room_permission(&c, &u, &room, 2)?; }
             let boxes = v["members"].as_array().ok_or(bad("Invalid participants"))?;
             let sealed = ciphertext(&v, "sealed", 65536)?;
             let tx = c.transaction()?;
@@ -986,6 +1011,14 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             tx.execute("DELETE FROM chat_space_members WHERE space=?", [&space])?;
             tx.execute("DELETE FROM chat_spaces WHERE id=?", [&space])?;
             tx.commit()?;
+            Ok(json!({"ok":true}))
+        }
+        "status" => {
+            let status = text(&v, "status");
+            if !["online", "idle", "dnd", "invisible"].contains(&status.as_str()) {
+                return Err(bad("Invalid status"));
+            }
+            c.execute("UPDATE chat_users SET status=? WHERE id=?", params![status,u.id])?;
             Ok(json!({"ok":true}))
         }
         "profile" => {
@@ -1102,6 +1135,36 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             if v["disabled"] == true {
                 c.execute("DELETE FROM chat_sessions WHERE user=?", [&id])?;
             }
+            Ok(json!({"ok":true}))
+        }
+        "admin.user.delete" => {
+            owner(&u)?;
+            let id = text(&v, "user");
+            let (node_owner, identity, username): (Option<i64>, String, String) = c.query_row(
+                "SELECT node_owner,identity,username FROM chat_users WHERE id=?", [&id],
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+            ).optional()?.ok_or(bad("Account not found"))?;
+            if node_owner.is_some() || id == u.id { return Err(denied()); }
+            let certificates = devices(&c, &id)?;
+            let certificates = certificates.as_array().unwrap().iter().map(|d| json!({"id":d["id"],"certificate":d["certificate"]})).collect::<Vec<_>>();
+            let tx = c.transaction()?;
+            tx.execute("INSERT INTO chat_deleted_users(id,identity,devices) VALUES(?,?,?)", params![id,identity,json!(certificates).to_string()])?;
+            tx.execute("UPDATE chat_rooms SET needs_rekey=2 WHERE id IN(SELECT room FROM chat_members WHERE user=?)", [&id])?;
+            tx.execute("DELETE FROM chat_key_packages WHERE device IN(SELECT id FROM chat_devices WHERE user=?)", [&id])?;
+            // Keep a durable cleanup record until ciphertext is physically removed.
+            tx.execute("UPDATE chat_objects SET complete=0,created=0 WHERE sender=?", [&id])?;
+            tx.execute("DELETE FROM chat_friends WHERE user=? OR other=?", params![id,id])?;
+            tx.execute("DELETE FROM chat_notices WHERE room=? AND kind IN ('friend.request','friend.accept')", [&id])?;
+            tx.execute("DELETE FROM chat_space_invites WHERE sender=? OR recipient=?", params![id,id])?;
+            tx.execute("DELETE FROM chat_auth WHERE username=?", [&username])?;
+            tx.execute("DELETE FROM chat_invites WHERE creator=?", [&id])?;
+            tx.execute("DELETE FROM chat_node_emoji WHERE creator=?", [&id])?;
+            for table in ["chat_sessions", "chat_devices", "chat_activity", "chat_presence", "chat_push", "chat_notices", "chat_login_policy", "chat_preferences", "chat_mutes", "chat_totp", "chat_recovery", "chat_members", "chat_space_members"] {
+                tx.execute(&format!("DELETE FROM {table} WHERE user=?"), [&id])?;
+            }
+            tx.execute("DELETE FROM chat_users WHERE id=?", [&id])?;
+            tx.commit()?;
+            cleanup(&c, a)?;
             Ok(json!({"ok":true}))
         }
         "space.quota" => {
@@ -1268,9 +1331,13 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             if instance.len() > 96 {
                 return Err(bad("Invalid browser instance"));
             }
-            c.execute("INSERT INTO chat_activity VALUES(?,?,?,?,?) ON CONFLICT(user,session,instance) DO UPDATE SET at=excluded.at,idle=excluded.idle",params![u.id,u.session,instance,now(),v["idle"].as_bool().unwrap_or(false) as i32])?;
+            if v["leave"] == true {
+                c.execute("DELETE FROM chat_activity WHERE user=? AND session=? AND instance=?", params![u.id,u.session,instance])?;
+            } else {
+                c.execute("INSERT INTO chat_activity(user,session,instance,at,idle,viewing) VALUES(?,?,?,?,?,?) ON CONFLICT(user,session,instance) DO UPDATE SET at=excluded.at,idle=excluded.idle,viewing=excluded.viewing",params![u.id,u.session,instance,now(),v["idle"].as_bool().unwrap_or(false) as i32,v["viewing"].as_bool().unwrap_or(true) as i32])?;
+            }
             c.execute("DELETE FROM chat_activity WHERE at<?", [now() - 300])?;
-            Ok(json!({"ok":true}))
+            Ok(json!({"ok":true,"users":directory(&c)?,"formerUsers":former_users(&c)?}))
         }
         "space.create" => {
             let policy = setting(&c, "policy")?;
@@ -2007,7 +2074,9 @@ pub fn cleanup(c: &Connection, a: &App) -> Api<()> {
     drop(q);
     for id in ids {
         if valid_id(&id) {
-            let _ = fs::remove_dir_all(a.cfg.data_dir.join("chat").join(&id));
+            if let Err(error) = fs::remove_dir_all(a.cfg.data_dir.join("chat").join(&id)) {
+                if error.kind() != std::io::ErrorKind::NotFound { continue; }
+            }
         }
         c.execute("DELETE FROM chat_parts WHERE object=?", [&id])?;
         c.execute("DELETE FROM chat_objects WHERE id=?", [&id])?;
@@ -2474,6 +2543,85 @@ mod polish_tests {
         let signature: Signature = key.sign(data.as_bytes());
         json!({"data":data,"signature":B64.encode(signature.to_bytes())})
     }
+    #[test]
+    fn reciprocal_friendships_are_returned_once_and_other_peoples_blocks_are_private() {
+        let (_dir, app, owner, reader, _key, owner_id, reader_id) = fixture();
+        run(&app, &owner, json!({"action":"friend","user":reader_id,"kind":"request"})).unwrap();
+        let incoming = run(&app, &reader, json!({"action":"friends"})).unwrap();
+        assert_eq!(incoming["friends"].as_array().unwrap().len(), 1);
+        run(&app, &reader, json!({"action":"friend","user":owner_id,"kind":"accept"})).unwrap();
+        for headers in [&owner, &reader] {
+            let result = run(&app, headers, json!({"action":"friends"})).unwrap();
+            assert_eq!(result["friends"].as_array().unwrap().len(), 1);
+            assert_eq!(result["friends"][0]["status"], "friend");
+        }
+        run(&app, &reader, json!({"action":"friend","user":owner_id,"kind":"remove"})).unwrap();
+        run(&app, &reader, json!({"action":"friend","user":owner_id,"kind":"block"})).unwrap();
+        assert!(run(&app, &owner, json!({"action":"friends"})).unwrap()["friends"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn status_and_presence_refresh_do_not_overwrite_profiles_and_leave_is_per_tab() {
+        let (_dir, app, owner, _reader, _key, owner_id, _reader_id) = fixture();
+        db(&app).unwrap().execute("UPDATE chat_users SET profile='encrypted-profile' WHERE id=?", [&owner_id]).unwrap();
+        run(&app, &owner, json!({"action":"status","status":"dnd"})).unwrap();
+        run(&app, &owner, json!({"action":"presence","instance":"one","idle":false})).unwrap();
+        let value = run(&app, &owner, json!({"action":"presence","instance":"two","idle":true})).unwrap();
+        assert_eq!(value["users"].as_array().unwrap().iter().find(|u| u["id"]==owner_id).unwrap()["status"], "dnd");
+        assert_eq!(run(&app, &owner, json!({"action":"profile.get","user":owner_id})).unwrap()["profile"], "encrypted-profile");
+        run(&app, &owner, json!({"action":"presence","instance":"two","leave":true})).unwrap();
+        assert!(active_now(&db(&app).unwrap(), &owner_id).unwrap());
+        run(&app, &owner, json!({"action":"presence","instance":"one","leave":true})).unwrap();
+        assert!(!active_now(&db(&app).unwrap(), &owner_id).unwrap());
+        run(&app, &owner, json!({"action":"status","status":"online"})).unwrap();
+        let background = run(&app, &owner, json!({"action":"presence","instance":"one","idle":false,"viewing":false})).unwrap();
+        assert_eq!(background["users"].as_array().unwrap().iter().find(|u| u["id"]==owner_id).unwrap()["status"], "online");
+        assert!(!active_now(&db(&app).unwrap(), &owner_id).unwrap());
+        assert!(run(&app, &owner, json!({"action":"status","status":"invalid"})).is_err());
+    }
+
+    #[test]
+    fn optional_authenticator_enrollment_requires_confirmation_then_returns_recovery_codes() {
+        let (_dir, app, _owner, reader, _key, _owner_id, reader_id) = fixture();
+        let seed = run(&app, &reader, json!({"action":"totp.start"})).unwrap()["seed"].as_str().unwrap().to_owned();
+        assert_eq!(db(&app).unwrap().query_row("SELECT totp FROM chat_users WHERE id=?", [&reader_id], |r| r.get::<_, String>(0)).unwrap(), "");
+        assert!(run(&app, &reader, json!({"action":"totp.finish","otp":"invalid"})).is_err());
+        let code = totp(&seed, now()/30).unwrap();
+        let result = run(&app, &reader, json!({"action":"totp.finish","otp":code})).unwrap();
+        assert_eq!(result["recovery"].as_array().unwrap().len(), 10);
+        assert_eq!(db(&app).unwrap().query_row("SELECT totp FROM chat_users WHERE id=?", [&reader_id], |r| r.get::<_, String>(0)).unwrap(), seed);
+    }
+
+    #[test]
+    fn permanent_account_deletion_revokes_access_and_retains_only_public_history_verification() {
+        let (_dir, app, owner, reader, _key, owner_id, reader_id) = fixture();
+        let room = random(24); let device = random(24); let object = random(24);
+        {
+            let c = db(&app).unwrap();
+            c.execute("INSERT INTO chat_rooms(id,space,kind,creator,sealed,created) VALUES(?,'','dm',?,'cipher',?)", params![room,reader_id,now()]).unwrap();
+            for id in [&owner_id,&reader_id] { c.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,'cipher')", params![room,id]).unwrap(); }
+            c.execute("INSERT INTO chat_devices VALUES(?,?,'{}','public-package',?,0)", params![device,reader_id,now()]).unwrap();
+            c.execute("INSERT INTO chat_preferences VALUES(?,'private-preferences')", [&reader_id]).unwrap();
+            c.execute("INSERT INTO chat_objects VALUES(?,?,?,?,?,?,1)", params![object,room,reader_id,64,64,now()]).unwrap();
+            c.execute("INSERT INTO chat_parts VALUES(?,0,'digest',64)", [&object]).unwrap();
+            c.execute("INSERT INTO chat_events(room,sender,device,id,kind,body,at) VALUES(?,?,?,?,'message','{}',?)", params![room,reader_id,device,random(24),now()]).unwrap();
+        }
+        let folder = app.cfg.data_dir.join("chat").join(&object);fs::create_dir_all(&folder).unwrap();fs::write(folder.join("0"), b"ciphertext").unwrap();
+        assert_eq!(run(&app, &reader, json!({"action":"admin.user.delete","user":owner_id})).unwrap_err().0, StatusCode::FORBIDDEN);
+        assert_eq!(run(&app, &owner, json!({"action":"admin.user.delete","user":owner_id})).unwrap_err().0, StatusCode::FORBIDDEN);
+        run(&app, &owner, json!({"action":"admin.user.delete","user":reader_id})).unwrap();
+        assert!(user(&app,&reader).is_err());assert!(!folder.exists());
+        let c = db(&app).unwrap();
+        for table in ["chat_users","chat_sessions","chat_devices","chat_preferences","chat_members"] {
+            let column = if table=="chat_users" {"id"} else {"user"};
+            assert_eq!(c.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE {column}=?"), [&reader_id], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+        assert_eq!(c.query_row("SELECT needs_rekey FROM chat_rooms WHERE id=?", [&room], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM chat_events WHERE sender=?", [&reader_id], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let former = former_users(&c).unwrap();assert_eq!(former[0]["id"],reader_id);assert_eq!(former[0]["devices"][0]["id"],device);assert!(former[0]["devices"][0]["keyPackage"].is_null());
+        assert!(!directory(&c).unwrap().as_array().unwrap().iter().any(|u| u["id"]==reader_id));
+    }
+
     #[test]
     fn encrypted_catalog_is_owner_only_signed_versioned_and_recipient_scoped() {
         let (_dir, app, owner, reader, key, owner_id, reader_id) = fixture();
