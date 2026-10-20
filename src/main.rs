@@ -1,4 +1,6 @@
 //! The service only handles ciphertext. Signing keys are verification-only.
+mod store;
+mod export;
 use anyhow::{Context, Result};
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::{
@@ -61,6 +63,9 @@ struct Inner {
     db: Mutex<Connection>,
     rates: Mutex<HashMap<String, (Instant, u32)>>,
     auth_slots: Arc<tokio::sync::Semaphore>,
+    io_slots: Arc<tokio::sync::Semaphore>,
+    request_slots: Arc<tokio::sync::Semaphore>,
+    gc: Mutex<GcCursor>,
 }
 type App = Arc<Inner>;
 #[derive(Clone)]
@@ -278,13 +283,14 @@ fn reserve(c: &Connection, app: &App, additional: u64) -> Api<()> {
     let a: i64 = c.query_row("SELECT COALESCE(SUM(remaining),0) FROM uploads", [], |r| {
         r.get(0)
     })?;
+    let jobs: i64 = c.query_row("SELECT COALESCE(SUM(remaining),0) FROM object_jobs", [], |r| r.get(0))?;
     let b: i64 = c.query_row(
         "SELECT COALESCE(SUM(MAX(0,budget-stored)+8388608),0) FROM shares WHERE state='uploading'",
         [],
         |r| r.get(0),
     )?;
     if free_bytes(&app.cfg.data_dir)?
-        .saturating_sub((a.max(0) as u64).saturating_add(b.max(0) as u64))
+        .saturating_sub((a.max(0) as u64).saturating_add(b.max(0) as u64).saturating_add(jobs.max(0) as u64))
         .saturating_sub(additional)
         < safety_floor(app)
     {
@@ -331,12 +337,14 @@ fn initialize(path: &Path) -> Result<Connection> {
   let mut q=c.prepare(sql)?;let rows=q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;drop(q);
   let tx=c.unchecked_transaction()?;for(id,revision,raw)in rows{let value:Value=serde_json::from_str(&raw)?;if let Some(parts)=value["blocks"].as_array(){for(n,part)in parts.iter().enumerate(){let p:Part=serde_json::from_value(part.clone())?;if is_revision{tx.execute("INSERT INTO revision_parts VALUES(?,?,?,?,?)",params![id,revision,n as i64,p.hash,p.size as i64])?;}else{tx.execute("INSERT INTO upload_parts VALUES(?,?,?,?)",params![id,n as i64,p.hash,p.size as i64])?;}}}}tx.commit()?;
  }
+    store::initialize(&c)?;
+    export::initialize(&c)?;
     Ok(c)
 }
 
 async fn info(State(a): State<App>) -> Json<Value> {
     Json(
-        json!({"node":a.cfg.node_id,"gate":format!("/gate/{}",a.cfg.bridge),"release":"2.3","chunk":BLOCK,"maxShare":MAX_SHARE}),
+        json!({"node":a.cfg.node_id,"gate":format!("/gate/{}",a.cfg.bridge),"release":"2.3","chunk":BLOCK,"maxShare":MAX_SHARE,"storage":4,"catalogPage":256,"metadataPage":65536,"maxVault":MAX_VAULT}),
     )
 }
 async fn health() -> Json<Value> {
@@ -583,6 +591,8 @@ async fn panic_logout(
     let mut c = db(&a)?;
     let tx = c.transaction()?;
     tx.execute("DELETE FROM vault_leases WHERE session=?", [&s.hash])?;
+    tx.execute("DELETE FROM object_jobs WHERE session=?", [&s.hash])?;
+    tx.execute("DELETE FROM encrypted_exports WHERE session=?", [&s.hash])?;
     tx.execute("DELETE FROM challenges WHERE session=?", [&s.hash])?;
     tx.execute("UPDATE shares SET state='revoked',recipient='' WHERE owner=? AND state IN('uploading','ready','receiving')",[s.owner])?;
     tx.execute("DELETE FROM sessions WHERE hash=?", [&s.hash])?;
@@ -669,6 +679,7 @@ async fn forget_vault(
         "DELETE FROM vault_leases WHERE vault=? AND session=?",
         params![id, s.hash],
     )?;
+    c.execute("DELETE FROM object_jobs WHERE vault=? AND session=?",params![id,s.hash])?;
     Ok(Json(json!({"ok":true})))
 }
 
@@ -795,6 +806,9 @@ async fn stage(
     }
     let mut c = db(&a)?;
     let (base, key) = owned(&c, &s, &id)?;
+    if c.query_row("SELECT EXISTS(SELECT 1 FROM vault_renewal WHERE vault=?)", [&id], |r| r.get::<_,bool>(0))? {
+        return Err(Fault(StatusCode::CONFLICT, "Update Vortex Vault to save this storage format"));
+    }
     if base != v.base {
         return Err(Fault(
             StatusCode::PRECONDITION_FAILED,
@@ -844,7 +858,7 @@ async fn stage(
     )?;
     prune_history(&mut c, &a, true)?;
     if reserve(&c, &a, amount + MAX_MANIFEST as u64).is_err() {
-        c.execute("DELETE FROM revisions WHERE EXISTS(SELECT 1 FROM vaults v WHERE v.id=revisions.vault AND revisions.number<v.revision)",[])?;
+        c.execute("DELETE FROM revisions WHERE EXISTS(SELECT 1 FROM vaults v WHERE v.id=revisions.vault AND revisions.number<v.revision) AND NOT EXISTS(SELECT 1 FROM object_jobs j WHERE j.vault=revisions.vault AND j.base=revisions.number) AND NOT EXISTS(SELECT 1 FROM export_pins p JOIN encrypted_exports e ON e.hash=p.ticket WHERE p.vault=revisions.vault AND p.revision=revisions.number AND e.deadline>unixepoch())",[])?;
         gc_blocks(&c, &a)?;
     }
     reserve(&c, &a, amount + MAX_MANIFEST as u64)?;
@@ -883,37 +897,17 @@ async fn put_block(
     if !valid_id(&uid) || body.len() > MAX_BLOCK {
         return Err(bad("Invalid encrypted block"));
     }
-    let c = db(&a)?;
-    let part=c.query_row("SELECT p.hash,p.size FROM upload_parts p JOIN uploads u ON u.id=p.upload WHERE u.id=? AND u.owner=? AND u.created>? AND p.number=?",params![uid,s.owner,now()-UPLOAD_SECONDS,n as i64],|r|Ok(Part{hash:r.get(0)?,size:r.get::<_,i64>(1)? as u64})).optional()?.ok_or(Fault(StatusCode::NOT_FOUND,"Upload piece unavailable"))?;
-    if body.len() as u64 != part.size || hash(&body) != part.hash {
-        return Err(bad("Encrypted block integrity check failed"));
-    }
-    let path = block_path(&a, s.owner, &part.hash);
-    if path.exists() {
-        return Ok(Json(json!({"ok":true})));
-    }
-    if free_bytes(&a.cfg.data_dir)?.saturating_sub(part.size) < safety_floor(&a) {
-        return Err(Fault(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "Storage buffer reached",
-        ));
-    }
-    fs::create_dir_all(path.parent().unwrap())?;
-    let temp = path.with_extension(random(12));
-    {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        f.write_all(&body)?;
-        f.sync_all()?;
-    }
-    fs::rename(&temp, &path)?;
-    sync_directory(path.parent().unwrap())?;
-    c.execute(
-        "UPDATE uploads SET remaining=MAX(0,remaining-?) WHERE id=?",
-        params![part.size as i64, uid],
-    )?;
+    let part={let c=db(&a)?;
+      c.query_row("SELECT p.hash,p.size FROM upload_parts p JOIN uploads u ON u.id=p.upload WHERE u.id=? AND u.owner=? AND u.created>? AND p.number=?",params![uid,s.owner,now()-UPLOAD_SECONDS,n as i64],|r|Ok(Part{hash:r.get(0)?,size:r.get::<_,i64>(1)? as u64})).optional()?.ok_or(Fault(StatusCode::NOT_FOUND,"Upload piece unavailable"))?};
+    if body.len() as u64!=part.size || hash(&body)!=part.hash {return Err(bad("Encrypted block integrity check failed"));}
+    let permit=a.io_slots.clone().acquire_owned().await.map_err(|_|Fault(StatusCode::SERVICE_UNAVAILABLE,"Storage busy"))?;
+    let present=fs::metadata(block_path(&a,s.owner,&part.hash)).map(|m|m.len()==part.size).unwrap_or(false);
+    let app=a.clone();let owner=s.owner;let digest=part.hash.clone();
+    tokio::task::spawn_blocking(move||{let _permit=permit;store::durable_object(&app,owner,&digest,&body)}).await.map_err(|_|Fault(StatusCode::SERVICE_UNAVAILABLE,"Storage write interrupted"))??;
+    let c=db(&a)?;
+    if !c.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE hash=? AND expires>?)",params![s.hash,now()],|r|r.get::<_,bool>(0))? {return Err(Fault(StatusCode::UNAUTHORIZED,"Your Node login expired"));}
+    c.execute("INSERT OR IGNORE INTO legacy_acks(upload,hash) VALUES(?,?)",params![uid,part.hash])?;
+    if !present && c.changes()==1 {c.execute("UPDATE uploads SET remaining=MAX(0,remaining-?) WHERE id=?",params![part.size as i64,uid])?;}
     Ok(Json(json!({"ok":true})))
 }
 async fn commit(
@@ -1084,6 +1078,10 @@ async fn manifest(
         v["bytes"].as_u64().unwrap_or(0),
         &s.ip,
     );
+    if v["format"]=="paged" {
+        let mut result=v;result["revision"]=json!(rev);result["unlock"]=c.query_row("SELECT epoch,issued,expires,seconds FROM vault_epochs WHERE vault=?",[&id],|r|Ok(json!({"epoch":r.get::<_,String>(0)?,"issued":r.get::<_,i64>(1)?,"expires":r.get::<_,i64>(2)?,"seconds":r.get::<_,i64>(3)?,"server_now":now()}))).optional()?.unwrap_or(Value::Null);
+        return Ok(Json(result));
+    }
     let parts: Vec<Part> =
         serde_json::from_value(v["blocks"].clone()).map_err(|_| bad("Invalid stored layout"))?;
     let mut indices = HashMap::new();
@@ -1158,7 +1156,7 @@ async fn challenge(
     let s = session(&a, &h, p)?;
     rate(&a, format!("challenge:{}", s.hash), 30)?;
     let purpose = text(&v, "purpose");
-    if !["verify", "share", "remember", "rotate"].contains(&purpose.as_str()) {
+    if !["verify", "share", "remember", "rotate", "write"].contains(&purpose.as_str()) {
         return Err(bad("Invalid verification purpose"));
     }
     let c = db(&a)?;
@@ -1285,47 +1283,23 @@ async fn share_piece(
     if !valid_id(&id) || body.len() > MAX_BLOCK || body.len() < 16 {
         return Err(bad("Invalid encrypted piece"));
     }
-    let c = db(&a)?;
-    let row:Option<(i64,i64,i64)>=c.query_row("SELECT pieces,budget,stored FROM shares WHERE id=? AND owner=? AND state='uploading' AND created>?",params![id,s.owner,now()-UPLOAD_SECONDS],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    let (count, budget, stored) =
-        row.ok_or(Fault(StatusCode::NOT_FOUND, "Transfer unavailable"))?;
-    if n >= count as u64 {
-        return Err(bad("Invalid piece index"));
-    }
-    let path = share_path(&a, &id).join(n.to_string());
-    if path.exists() {
-        if hash(fs::read(&path)?) != hash(&body) {
-            return Err(Fault(
-                StatusCode::CONFLICT,
-                "Encrypted piece already exists",
-            ));
-        }
-        return Ok(Json(json!({"ok":true})));
-    }
-    if stored + body.len() as i64 > budget {
-        return Err(bad("Transfer exceeded its declared size"));
-    }
-    if free_bytes(&a.cfg.data_dir)?.saturating_sub(body.len() as u64) < safety_floor(&a) {
-        return Err(Fault(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "Storage buffer reached",
-        ));
-    }
-    let temporary = path.with_extension(random(12));
-    {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        f.write_all(&body)?;
-        f.sync_all()?;
-    }
-    fs::rename(temporary, &path)?;
-    sync_directory(path.parent().unwrap())?;
-    c.execute(
-        "UPDATE shares SET stored=stored+? WHERE id=?",
-        params![body.len() as i64, id],
-    )?;
+    let digest=hash(&body);let length=body.len() as i64;
+    {let mut c=db(&a)?;let tx=c.transaction()?;
+      let(count,budget,stored):(i64,i64,i64)=tx.query_row("SELECT pieces,budget,stored FROM shares WHERE id=? AND owner=? AND state='uploading' AND created>?",params![id,s.owner,now()-UPLOAD_SECONDS],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or(Fault(StatusCode::NOT_FOUND,"Transfer unavailable"))?;
+      if n>=count as u64{return Err(bad("Invalid piece index"));}
+      let prior:Option<(String,i64)>=tx.query_row("SELECT hash,size FROM transfer_pieces WHERE share=? AND number=?",params![id,n as i64],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+      if let Some((h,size))=prior{if h!=digest||size!=length{return Err(Fault(StatusCode::CONFLICT,"Encrypted piece already exists"));}}
+      else{let pending:i64=tx.query_row("SELECT COALESCE(SUM(size),0) FROM transfer_pieces WHERE share=? AND ready=0",[&id],|r|r.get(0))?;
+        if stored+pending+length>budget{return Err(bad("Transfer exceeded its declared size"));}
+        tx.execute("INSERT INTO transfer_pieces VALUES(?,?,?,?,0)",params![id,n as i64,digest,length])?;}
+      tx.commit()?;}
+    let permit=a.io_slots.clone().acquire_owned().await.map_err(|_|Fault(StatusCode::SERVICE_UNAVAILABLE,"Storage busy"))?;
+    let app=a.clone();let expected=digest.clone();let path=share_path(&a,&id).join(n.to_string());
+    tokio::task::spawn_blocking(move||{let _permit=permit;store::durable_file(&app,&path,&expected,&body)}).await.map_err(|_|Fault(StatusCode::SERVICE_UNAVAILABLE,"Storage write interrupted"))??;
+    let mut c=db(&a)?;let tx=c.transaction()?;
+    if !tx.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE hash=? AND expires>?)",params![s.hash,now()],|r|r.get::<_,bool>(0))? || !tx.query_row("SELECT EXISTS(SELECT 1 FROM shares WHERE id=? AND owner=? AND state='uploading')",params![id,s.owner],|r|r.get::<_,bool>(0))?{return Err(Fault(StatusCode::NOT_FOUND,"Transfer unavailable"));}
+    if tx.execute("UPDATE transfer_pieces SET ready=1 WHERE share=? AND number=? AND ready=0",params![id,n as i64])?==1{tx.execute("UPDATE shares SET stored=stored+? WHERE id=?",params![length,id])?;}
+    tx.commit()?;
     Ok(Json(json!({"ok":true})))
 }
 async fn publish(
@@ -1349,25 +1323,16 @@ async fn publish(
     if encrypted.len() < 28 || encrypted.len() > MAX_MANIFEST {
         return Err(bad("Invalid encrypted manifest"));
     }
-    let c = db(&a)?;
-    let row:Option<(i64,i64,i64,String)>=c.query_row("SELECT pieces,budget,stored,vault FROM shares WHERE id=? AND owner=? AND state='uploading'",params![id,s.owner],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-    let (count, budget, stored, vault) =
-        row.ok_or(Fault(StatusCode::NOT_FOUND, "Transfer unavailable"))?;
-    if budget != stored {
-        return Err(bad("Transfer is incomplete"));
-    }
-    for i in 0..count {
-        if !share_path(&a, &id).join(i.to_string()).is_file() {
-            return Err(bad("Transfer is incomplete"));
-        }
-    }
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(share_path(&a, &id).join("manifest"))?;
-    f.write_all(&encrypted)?;
-    f.sync_all()?;
-    sync_directory(&share_path(&a, &id))?;
+    let(budget,vault)={let c=db(&a)?;
+      let(count,budget,stored,vault):(i64,i64,i64,String)=c.query_row("SELECT pieces,budget,stored,vault FROM shares WHERE id=? AND owner=? AND state='uploading'",params![id,s.owner],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?.ok_or(Fault(StatusCode::NOT_FOUND,"Transfer unavailable"))?;
+      if budget!=stored || c.query_row("SELECT COUNT(*) FROM transfer_pieces WHERE share=? AND ready=1",[&id],|r|r.get::<_,i64>(0))?!=count{return Err(bad("Transfer is incomplete"));}
+      check_epoch(&c,&vault)?;(budget,vault)};
+    let permit=a.io_slots.clone().acquire_owned().await.map_err(|_|Fault(StatusCode::SERVICE_UNAVAILABLE,"Storage busy"))?;
+    let app=a.clone();let path=share_path(&a,&id).join("manifest");let digest=hash(&encrypted);
+    tokio::task::spawn_blocking(move||{let _permit=permit;store::durable_file(&app,&path,&digest,&encrypted)}).await.map_err(|_|Fault(StatusCode::SERVICE_UNAVAILABLE,"Storage write interrupted"))??;
+    let c=db(&a)?;
+    if !c.query_row("SELECT EXISTS(SELECT 1 FROM shares WHERE id=? AND owner=? AND state='uploading')",params![id,s.owner],|r|r.get::<_,bool>(0))? || !c.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE hash=? AND expires>?)",params![s.hash,now()],|r|r.get::<_,bool>(0))?{return Err(Fault(StatusCode::NOT_FOUND,"Transfer unavailable"));}
+    check_epoch(&c,&vault)?;
     c.execute(
         "UPDATE shares SET state='ready',ready=?,expires=?,claim_hash=? WHERE id=?",
         params![now(), now() + CLAIM_SECONDS, lookup, id],
@@ -1557,7 +1522,7 @@ async fn complete(
     Ok(Json(json!({"ok":true})))
 }
 
-fn prune_history(c: &mut Connection, a: &App, pressure: bool) -> Api<()> {
+fn prune_history(c: &Connection, a: &App, pressure: bool) -> Api<()> {
     // Three total revisions normally; one total under pressure. Never delete the current revision.
     let keep =
         if pressure && free_bytes(&a.cfg.data_dir)? < safety_floor(&a) + 4 * 1024 * 1024 * 1024 {
@@ -1565,36 +1530,41 @@ fn prune_history(c: &mut Connection, a: &App, pressure: bool) -> Api<()> {
         } else {
             3
         };
-    c.execute("DELETE FROM revisions WHERE EXISTS(SELECT 1 FROM vaults v WHERE v.id=revisions.vault AND revisions.number<=v.revision-?)",[keep])?;
+    c.execute("DELETE FROM revisions WHERE EXISTS(SELECT 1 FROM vaults v WHERE v.id=revisions.vault AND revisions.number<=v.revision-?) AND NOT EXISTS(SELECT 1 FROM object_jobs j WHERE j.vault=revisions.vault AND j.base=revisions.number) AND NOT EXISTS(SELECT 1 FROM export_pins p JOIN encrypted_exports e ON e.hash=p.ticket WHERE p.vault=revisions.vault AND p.revision=revisions.number AND e.deadline>unixepoch())",[keep])?;
     if pressure {
         gc_blocks(c, a)?;
     }
     Ok(())
 }
+#[derive(Default)]
+struct GcCursor { owners: Option<fs::ReadDir>, files: Option<(i64,fs::ReadDir)> }
 fn gc_blocks(c: &Connection, a: &App) -> Api<()> {
-    let mut used = std::collections::HashSet::new();
-    let mut st=c.prepare("SELECT v.owner,p.hash FROM revision_parts p JOIN vaults v ON v.id=p.vault UNION SELECT u.owner,p.hash FROM upload_parts p JOIN uploads u ON u.id=p.upload")?;
-    for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
-        used.insert(row?);
-    }
-    drop(st);
-    for owner_dir in fs::read_dir(a.cfg.data_dir.join("blocks"))? {
-        let d = owner_dir?;
-        let Some(owner) = d.file_name().to_str().and_then(|s| s.parse::<i64>().ok()) else {
-            continue;
-        };
-        for file in fs::read_dir(d.path())? {
-            let f = file?;
-            let name = f.file_name().to_string_lossy().to_string();
-            if !used.contains(&(owner, name)) {
-                let _ = fs::remove_file(f.path());
+    let mut cursor=a.gc.lock().map_err(|_|Fault(StatusCode::SERVICE_UNAVAILABLE,"Storage busy"))?;
+    if cursor.owners.is_none(){cursor.owners=Some(fs::read_dir(a.cfg.data_dir.join("blocks"))?);}
+    let start=Instant::now();
+    for _ in 0..1024 {
+        if start.elapsed()>Duration::from_millis(30){break;}
+        if let Some((owner,files))=cursor.files.as_mut() {
+            if let Some(entry)=files.next(){
+                let entry=entry?;let name=entry.file_name().to_string_lossy().to_string();
+                if !valid_hash(&name){continue;}
+                let used:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM revision_objects p JOIN vaults v ON v.id=p.vault WHERE v.owner=?1 AND p.hash=?2) OR EXISTS(SELECT 1 FROM job_objects p JOIN object_jobs j ON j.id=p.job WHERE j.owner=?1 AND p.hash=?2) OR EXISTS(SELECT 1 FROM revision_parts p JOIN vaults v ON v.id=p.vault WHERE v.owner=?1 AND p.hash=?2) OR EXISTS(SELECT 1 FROM upload_parts p JOIN uploads u ON u.id=p.upload WHERE u.owner=?1 AND p.hash=?2)",params![*owner,name],|r|r.get(0))?;
+                if !used {let _=fs::remove_file(entry.path());}
+                continue;
             }
+            cursor.files=None;
+        }
+        match cursor.owners.as_mut().unwrap().next(){
+            Some(entry)=>{let entry=entry?;if let Some(owner)=entry.file_name().to_str().and_then(|s|s.parse::<i64>().ok()){cursor.files=Some((owner,fs::read_dir(entry.path())?));}}
+            None=>{cursor.owners=None;break;}
         }
     }
     Ok(())
 }
 fn cleanup(c: &mut Connection, a: &App) -> Api<()> {
     let t = now();
+    store::cleanup(c)?;
+    c.execute("DELETE FROM encrypted_exports WHERE deadline<=? OR session NOT IN(SELECT hash FROM sessions)",[t])?;
     c.execute("DELETE FROM sessions WHERE expires<=?", [t])?;
     c.execute("DELETE FROM vault_leases WHERE expires<=? OR session NOT IN(SELECT hash FROM sessions) OR NOT EXISTS(SELECT 1 FROM vault_epochs e WHERE e.vault=vault_leases.vault AND e.epoch=vault_leases.epoch AND e.expires>? AND e.seconds>0)",params![t,t])?;
     c.execute("DELETE FROM challenges WHERE expires<=?", [t])?;
@@ -1636,6 +1606,12 @@ async fn receive_html() -> Response {
     )
         .into_response()
 }
+async fn export_html() -> Response {
+    let nonce=random(18);
+    let html=include_str!("../web/export.html").replace("/*VORTEX_CODEC*/",include_str!("../web/codec.js")).replace("<script>",&format!("<script nonce=\"{nonce}\"> ")).replace("<style>",&format!("<style nonce=\"{nonce}\">"));
+    let policy=format!("default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; worker-src 'self'; frame-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
+    ([(header::CONTENT_TYPE,"text/html; charset=utf-8"),(header::CONTENT_SECURITY_POLICY,policy.as_str())],html).into_response()
+}
 async fn worker() -> Response {
     (
         [
@@ -1665,6 +1641,10 @@ async fn gate_guard(
     }
     next.run(request).await
 }
+async fn admission(State(a):State<App>,request:axum::extract::Request,next:axum::middleware::Next)->Response {
+    let permit=match a.request_slots.clone().try_acquire_owned(){Ok(p)=>p,Err(_)=>return Fault(StatusCode::SERVICE_UNAVAILABLE,"Storage busy; retry shortly").into_response()};
+    let result=next.run(request).await;drop(permit);result
+}
 fn router(a: App) -> Router {
     let gate = format!("/gate/{}", a.cfg.bridge);
     let routes = Router::new()
@@ -1682,6 +1662,18 @@ fn router(a: App) -> Router {
         .route("/vaults", get(vaults).post(create_vault))
         .route("/vault/{id}", get(manifest).delete(remove_vault))
         .route("/vault/{id}/stage", post(stage))
+        .route("/vault/{id}/history", get(store::history))
+        .route("/vault/{id}/export", post(export::ticket))
+        .route("/vault/{id}/renew", post(store::renewal_challenge))
+        .route("/vault/{id}/write", post(store::begin).get(store::pending))
+        .route("/write/{id}", get(store::job).delete(store::cancel))
+        .route("/write/{id}/catalog", post(store::register).layer(DefaultBodyLimit::max(64*1024)))
+        .route("/write/{id}/reserve", post(store::grow).layer(DefaultBodyLimit::max(4096)))
+        .route("/write/{id}/checkpoint", post(store::checkpoint).layer(DefaultBodyLimit::max(384*1024)))
+        .route("/write/{id}/finish", post(store::finish).layer(DefaultBodyLimit::max(384*1024)))
+        .route("/write/{id}/object/{hash}", put(store::put_object).get(store::job_object).layer(DefaultBodyLimit::max(MAX_BLOCK)))
+        .route("/vault/{id}/{rev}/objects", get(store::catalog))
+        .route("/vault/{id}/{rev}/object/{hash}", get(store::object))
         .route(
             "/upload/{id}/{n}",
             put(put_block).layer(DefaultBodyLimit::max(MAX_BLOCK)),
@@ -1701,10 +1693,12 @@ fn router(a: App) -> Router {
     Router::new()
         .route("/connect", get(info))
         .route("/health", get(health))
+        .route("/download/{ticket}", get(export::download))
         .route("/", get(receive_html))
         .route("/receive/", get(receive_html))
         .route("/receive/{id}", get(receive_html))
         .route("/receive/worker.js", get(worker))
+        .route("/receive/export", get(export_html))
         .route(
             "/receive/preview/{id}",
             post(preview).layer(DefaultBodyLimit::max(4096)),
@@ -1722,6 +1716,7 @@ fn router(a: App) -> Router {
         .route("/vault/", get(vault_html))
         .route("/Vault", get(vault_html))
         .nest(&gate, routes)
+        .layer(axum::middleware::from_fn_with_state(a.clone(),admission))
         .layer(DefaultBodyLimit::max(2 * MAX_MANIFEST + 65536))
         .layer(
             CorsLayer::new()
@@ -1957,6 +1952,9 @@ async fn run() -> Result<()> {
         db: Mutex::new(c),
         rates: Mutex::new(HashMap::new()),
         auth_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+        io_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+        request_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+        gc: Mutex::new(GcCursor::default()),
     });
     {
         let mut c = db(&a).map_err(|_| anyhow::anyhow!("Database unavailable"))?;
@@ -1965,12 +1963,16 @@ async fn run() -> Result<()> {
     }
     let maintenance = a.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        let mut last_cleanup=Instant::now()-Duration::from_secs(60);
         loop {
             tick.tick().await;
             if let Ok(mut c) = maintenance.db.lock() {
-                let _ = cleanup(&mut c, &maintenance);
-                let _ = prune_history(&mut c, &maintenance, false);
+                if last_cleanup.elapsed()>=Duration::from_secs(60){
+                    let _ = cleanup(&mut c, &maintenance);
+                    let _ = prune_history(&mut c, &maintenance, false);
+                    last_cleanup=Instant::now();
+                }
                 let _ = gc_blocks(&c, &maintenance);
             }
         }
