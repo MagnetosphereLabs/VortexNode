@@ -4,9 +4,11 @@ self.addEventListener('install',event=>event.waitUntil(self.skipWaiting()));
 self.addEventListener('activate',event=>event.waitUntil(self.clients.claim()));
 self.addEventListener('message',event=>{
  const {begin,name,size}=event.data||{},port=event.ports[0];
- if(!port||typeof begin!=='string'||!/^[A-Za-z0-9_-]{32}$/.test(begin)||typeof name!=='string'||name.length>200||!Number.isSafeInteger(size)||size<0)return;
+ if(!port||typeof begin!=='string'||!/^[A-Za-z0-9_-]{32}$/.test(begin)||typeof name!=='string'||name.length>4096||!Number.isSafeInteger(size)||size<0)return;
+ if(pending.size>=8){port.postMessage({error:'Finish a download before starting another.'});port.close();return;}
+ const clean=name.replace(/[\x00-\x1f\x7f\"\\/]/g,'_'),dot=clean.lastIndexOf('.'),suffix=dot>0&&clean.length-dot<=16?clean.slice(dot):'',short=clean.length>200?clean.slice(0,200-suffix.length)+suffix:clean;
  const timer=setTimeout(()=>{pending.delete(begin);port.postMessage({error:'Your browser did not start the download. Allow downloads and retry.'});port.close()},60000);
- pending.set(begin,{port,name:name.replace(/[\x00-\x1f\x7f"\\/]/g,'_'),size,timer});port.postMessage({ready:true});
+ pending.set(begin,{port,name:short,size,timer});port.postMessage({ready:true});
 });
 self.addEventListener('fetch',event=>{
  const url=new URL(event.request.url);if(url.origin!==self.location.origin||!url.pathname.startsWith('/receive/download/'))return;
