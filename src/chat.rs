@@ -168,14 +168,31 @@ fn devices(c: &Connection, id: &str) -> Api<Value> {
     Ok(json!(rows))
 }
 fn directory(c: &Connection) -> Api<Value> {
-    let mut q=c.prepare("SELECT id,username,display,identity,profile,CASE WHEN status='invisible' OR COALESCE((SELECT at FROM chat_presence WHERE user=chat_users.id),0)<unixepoch()-90 THEN 'offline' WHEN status='online' AND COALESCE((SELECT idle FROM chat_presence WHERE user=chat_users.id),0)=1 THEN 'idle' ELSE status END,created,node_owner IS NOT NULL FROM chat_users WHERE disabled=0 ORDER BY username LIMIT 4096")?;
+    let mut q=c.prepare("SELECT id,username,display,identity,profile,CASE WHEN status='invisible' OR NOT EXISTS(SELECT 1 FROM chat_activity WHERE user=chat_users.id AND at>unixepoch()-90) THEN 'offline' WHEN status='online' AND NOT EXISTS(SELECT 1 FROM chat_activity WHERE user=chat_users.id AND at>unixepoch()-45 AND idle=0) THEN 'idle' ELSE status END,created,node_owner IS NOT NULL FROM chat_users WHERE disabled=0 ORDER BY username LIMIT 4096")?;
     let rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"username":r.get::<_,String>(1)?,"display":r.get::<_,String>(2)?,"identity":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(Value::Null),"profile":!r.get::<_,String>(4)?.is_empty(),"status":r.get::<_,String>(5)?,"created":r.get::<_,i64>(6)?,"owner":r.get::<_,bool>(7)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     Ok(json!(rows))
 }
+fn active_now(c: &Connection, user: &str) -> Api<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM chat_activity WHERE user=? AND at>? AND idle=0)",
+        params![user, now() - 45],
+        |r| r.get(0),
+    )?)
+}
 fn notify(c: &Connection, target: &str, kind: &str, room: &str) -> Api<()> {
+    let muted:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM chat_mutes WHERE user=? AND until>? AND (scope='room:'||? OR scope='space:'||COALESCE((SELECT space FROM chat_rooms WHERE id=?),'')))",params![target,now(),room,room],|r|r.get(0))?;
+    let dnd: bool = c
+        .query_row(
+            "SELECT status='dnd' FROM chat_users WHERE id=?",
+            [target],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    let push_ok = !(muted || dnd || active_now(c, target)?);
     c.execute(
-        "INSERT INTO chat_notices(user,kind,room,at) VALUES(?,?,?,?)",
-        params![target, kind, room, now()],
+        "INSERT INTO chat_notices(user,kind,room,at,push_ok) VALUES(?,?,?,?,?)",
+        params![target, kind, room, now(), push_ok as i32],
     )?;
     Ok(())
 }
@@ -214,6 +231,10 @@ pub fn initialize(c: &Connection) -> Result<()> {
  CREATE TABLE IF NOT EXISTS chat_preferences(user TEXT PRIMARY KEY,body TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS chat_node_emoji(id TEXT PRIMARY KEY,creator TEXT NOT NULL,body TEXT NOT NULL,audience TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS chat_presence(user TEXT PRIMARY KEY,at INTEGER NOT NULL,idle INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS chat_activity(user TEXT NOT NULL,session TEXT NOT NULL,instance TEXT NOT NULL,at INTEGER NOT NULL,idle INTEGER NOT NULL,PRIMARY KEY(user,session,instance));
+ CREATE INDEX IF NOT EXISTS chat_activity_user ON chat_activity(user,at);
+ CREATE TABLE IF NOT EXISTS chat_mutes(user TEXT NOT NULL,scope TEXT NOT NULL,until INTEGER NOT NULL,PRIMARY KEY(user,scope));
+ CREATE TABLE IF NOT EXISTS chat_space_invites(id TEXT PRIMARY KEY,space TEXT NOT NULL,sender TEXT NOT NULL,recipient TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',created INTEGER NOT NULL);
  CREATE INDEX IF NOT EXISTS chat_object_sender ON chat_objects(sender);
  CREATE INDEX IF NOT EXISTS chat_object_room ON chat_objects(room);
  CREATE INDEX IF NOT EXISTS chat_event_sender ON chat_events(sender);
@@ -224,6 +245,14 @@ pub fn initialize(c: &Connection) -> Result<()> {
     if !c.prepare("SELECT quota FROM chat_spaces LIMIT 0").is_ok() {
         c.execute(
             "ALTER TABLE chat_spaces ADD COLUMN quota INTEGER NOT NULL DEFAULT 107374182400",
+            [],
+        )?;
+    }
+    if c.prepare("SELECT push_ok FROM chat_notices LIMIT 0")
+        .is_err()
+    {
+        c.execute(
+            "ALTER TABLE chat_notices ADD COLUMN push_ok INTEGER NOT NULL DEFAULT 1",
             [],
         )?;
     }
@@ -312,6 +341,7 @@ pub async fn action(
         "devices",
         "room.members",
         "notices",
+        "space.invites",
         "auth.config",
         "presence",
         "emoji.list",
@@ -691,6 +721,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
         }
         "logout" => {
             c.execute("DELETE FROM chat_push WHERE session=?", [&u.session])?;
+            c.execute("DELETE FROM chat_activity WHERE session=?", [&u.session])?;
             c.execute("DELETE FROM chat_sessions WHERE hash=?", [&u.session])?;
             if u.owner {
                 c.execute("DELETE FROM sessions WHERE hash=?", [&u.session])?;
@@ -829,6 +860,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 return Err(denied());
             }
             if c.query_row("SELECT EXISTS(SELECT 1 FROM chat_friends WHERE user=? AND other=? AND status='blocked')",params![other,u.id],|r|r.get::<_,bool>(0))? {return Err(denied())}
+            let was_request:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM chat_friends WHERE user=? AND other=? AND status='request')",params![u.id,other],|r|r.get(0))?;
             let tx = c.transaction()?;
             if kind == "remove" {
                 tx.execute(
@@ -843,6 +875,12 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                         params![other, u.id],
                     )?;
                 }
+            }
+            if kind == "request" && !was_request {
+                notify(&tx, &other, "friend.request", &u.id)?;
+            }
+            if kind == "accept" {
+                notify(&tx, &other, "friend.accept", &u.id)?;
             }
             tx.commit()?;
             Ok(json!({"ok":true}))
@@ -896,10 +934,8 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
         }
         "space.members" => {
             let space = text(&v, "space");
-            if !permission(&c, &u, &space, 1)?
-                && !permission(&c, &u, &space, 2)?
-                && !permission(&c, &u, &space, 128)?
-            {
+            let included:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM chat_space_members WHERE space=? AND user=? AND banned=0)",params![space,u.id],|r|r.get(0))?;
+            if !included {
                 return Err(denied());
             }
             let mut q = c.prepare(
@@ -1080,8 +1116,160 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             )?;
             Ok(json!({"ok":true}))
         }
+        "mute" => {
+            let scope = text(&v, "scope");
+            if let Some(room) = scope.strip_prefix("room:") {
+                member(&c, &u, room)?;
+            } else if let Some(space) = scope.strip_prefix("space:") {
+                let yes:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM chat_space_members WHERE space=? AND user=? AND banned=0)",params![space,u.id],|r|r.get(0))?;
+                if !yes {
+                    return Err(denied());
+                }
+            } else {
+                return Err(bad("Invalid notification scope"));
+            }
+            let until = v["until"]
+                .as_i64()
+                .unwrap_or(0)
+                .clamp(0, now() + 366 * 86400 * 10);
+            c.execute("INSERT INTO chat_mutes VALUES(?,?,?) ON CONFLICT(user,scope) DO UPDATE SET until=excluded.until",params![u.id,scope,until])?;
+            Ok(json!({"ok":true}))
+        }
+        "space.invites" => {
+            let mut q=c.prepare("SELECT id,space,sender,recipient,body,status,created FROM chat_space_invites WHERE (recipient=? OR sender=?) AND created>? ORDER BY created DESC LIMIT 100")?;
+            let invites=q.query_map(params![u.id,u.id,now()-30*86400],|r|Ok(json!({"id":r.get::<_,String>(0)?,"space":r.get::<_,String>(1)?,"sender":r.get::<_,String>(2)?,"recipient":r.get::<_,String>(3)?,"body":serde_json::from_str::<Value>(&r.get::<_,String>(4)?).unwrap_or(Value::Null),"status":r.get::<_,String>(5)?,"created":r.get::<_,i64>(6)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            Ok(json!({"invites":invites}))
+        }
+        "space.invite" => {
+            let space = text(&v, "space");
+            if !permission(&c, &u, &space, 2)? {
+                return Err(denied());
+            }
+            let target = text(&v, "user");
+            let id = text(&v, "id");
+            if !valid_id(&id) || target == u.id {
+                return Err(bad("Invalid invitation"));
+            }
+            let body = &v["body"];
+            let rooms = body["rooms"].as_array().ok_or(bad("Choose channels"))?;
+            if rooms.is_empty() || rooms.len() > 256 || body.to_string().len() > 4 * 1024 * 1024 {
+                return Err(bad("Invalid invitation"));
+            }
+            let active: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM chat_users WHERE id=? AND disabled=0)",
+                [&target],
+                |r| r.get(0),
+            )?;
+            if !active {
+                return Err(bad("Unknown username"));
+            }
+            let blocked:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM chat_space_members WHERE space=? AND user=? AND banned=1)",params![space,target],|r|r.get(0))?;
+            if blocked {
+                return Err(denied());
+            }
+            for item in rooms {
+                let room = text(item, "room");
+                room_permission(&c, &u, &room, 2)?;
+                let (actual, base): (String, String) = c.query_row(
+                    "SELECT space,sealed FROM chat_rooms WHERE id=?",
+                    [&room],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let creator: String =
+                    c.query_row("SELECT creator FROM chat_rooms WHERE id=?", [&room], |r| {
+                        r.get(0)
+                    })?;
+                if actual != space || base != text(item, "base") || creator != text(item, "creator")
+                {
+                    return Err(conflict());
+                }
+                ciphertext(item, "box", 32768)?;
+                ciphertext(item, "sealed", 65536)?;
+            }
+            ciphertext(body, "label", 32768)?;
+            decode(body, "signature", 256)?;
+            let retained: i64 = c.query_row(
+                "SELECT COALESCE(SUM(length(body)),0) FROM chat_space_invites WHERE sender=?",
+                [&u.id],
+                |r| r.get(0),
+            )?;
+            if retained.saturating_add(body.to_string().len() as i64) > 64 * 1024 * 1024 {
+                return Err(bad("Invitation storage limit reached. Try again later."));
+            }
+            let tx = c.transaction()?;
+            reserve(&tx, a, body.to_string().len() as u64)?;
+            tx.execute("UPDATE chat_space_invites SET status='superseded' WHERE space=? AND recipient=? AND status='pending'",params![space,target])?;
+            tx.execute("INSERT INTO chat_space_invites(id,space,sender,recipient,body,created) VALUES(?,?,?,?,?,?)",params![id,space,u.id,target,body.to_string(),now()])?;
+            notify(&tx, &target, "space.invite", &id)?;
+            tx.commit()?;
+            Ok(json!({"ok":true}))
+        }
+        "space.invite.respond" => {
+            let id = text(&v, "id");
+            let (space,recipient,raw,status,created,sender):(String,String,String,String,i64,String)=c.query_row("SELECT space,recipient,body,status,created,sender FROM chat_space_invites WHERE id=?",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+            if recipient != u.id || status != "pending" || created < now() - 7 * 86400 {
+                return Err(denied());
+            }
+            let accept = v["accept"].as_bool().unwrap_or(false);
+            let body: Value = serde_json::from_str(&raw).map_err(|_| bad("Invalid invitation"))?;
+            let tx = c.transaction()?;
+            if accept {
+                let inviter_owner: bool = tx
+                    .query_row(
+                        "SELECT node_owner IS NOT NULL FROM chat_users WHERE id=? AND disabled=0",
+                        [&sender],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .ok_or(denied())?;
+                let inviter = User {
+                    id: sender.clone(),
+                    owner: inviter_owner,
+                    session: String::new(),
+                };
+                if !permission(&tx, &inviter, &space, 2)? {
+                    return Err(denied());
+                }
+                let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_space_members WHERE space=? AND user=? AND banned=1)",params![space,u.id],|r|r.get(0))?;
+                if blocked {
+                    return Err(denied());
+                }
+                for item in body["rooms"].as_array().ok_or(bad("Invalid invitation"))? {
+                    let room = text(item, "room");
+                    room_permission(&tx, &inviter, &room, 2)?;
+                    let (actual, base): (String, String) = tx.query_row(
+                        "SELECT space,sealed FROM chat_rooms WHERE id=?",
+                        [&room],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
+                    if actual != space || base != text(item, "base") {
+                        return Err(bad("This invitation needs to be refreshed. Ask the sender to invite you again."));
+                    }
+                    tx.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,?) ON CONFLICT(room,user) DO UPDATE SET box=excluded.box WHERE banned=0",params![room,u.id,text(item,"box")])?;
+                    tx.execute(
+                        "UPDATE chat_rooms SET sealed=? WHERE id=?",
+                        params![text(item, "sealed"), room],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO chat_space_members(space,user) VALUES(?,?)",
+                    params![space, u.id],
+                )?;
+            }
+            tx.execute(
+                "UPDATE chat_space_invites SET status=? WHERE id=?",
+                params![if accept { "accepted" } else { "declined" }, id],
+            )?;
+            tx.commit()?;
+            Ok(json!({"ok":true}))
+        }
         "presence" => {
-            c.execute("INSERT INTO chat_presence VALUES(?,?,?) ON CONFLICT(user) DO UPDATE SET at=excluded.at,idle=excluded.idle",params![u.id,now(),v["idle"].as_bool().unwrap_or(false) as i32])?;
+            let instance = text(&v, "instance");
+            if instance.len() > 96 {
+                return Err(bad("Invalid browser instance"));
+            }
+            c.execute("INSERT INTO chat_activity VALUES(?,?,?,?,?) ON CONFLICT(user,session,instance) DO UPDATE SET at=excluded.at,idle=excluded.idle",params![u.id,u.session,instance,now(),v["idle"].as_bool().unwrap_or(false) as i32])?;
+            c.execute("DELETE FROM chat_activity WHERE at<?", [now() - 300])?;
             Ok(json!({"ok":true}))
         }
         "space.create" => {
@@ -1475,8 +1663,8 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
         }
         "notices" => {
             let after = v["after"].as_i64().unwrap_or(0);
-            let mut q=c.prepare("SELECT id,kind,room,at FROM chat_notices WHERE user=? AND id>? ORDER BY id LIMIT 100")?;
-            let rows=q.query_map(params![u.id,after],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"kind":r.get::<_,String>(1)?,"room":r.get::<_,String>(2)?,"at":r.get::<_,i64>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            let mut q=c.prepare("SELECT id,kind,room,at,push_ok AND NOT EXISTS(SELECT 1 FROM chat_mutes m WHERE m.user=chat_notices.user AND m.until>unixepoch() AND (m.scope='room:'||chat_notices.room OR m.scope='space:'||COALESCE((SELECT space FROM chat_rooms WHERE id=chat_notices.room),''))) FROM chat_notices WHERE user=? AND id>? ORDER BY id LIMIT 100")?;
+            let rows=q.query_map(params![u.id,after],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"kind":r.get::<_,String>(1)?,"room":r.get::<_,String>(2)?,"at":r.get::<_,i64>(3)?,"pushAllowed":r.get::<_,bool>(4)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
             Ok(json!({"notices":rows}))
         }
         "totp.disable" => {
@@ -1802,6 +1990,12 @@ pub fn cleanup(c: &Connection, a: &App) -> Api<()> {
     )?;
     c.execute("DELETE FROM chat_sessions WHERE expires<?", [now()])?;
     c.execute("DELETE FROM chat_notices WHERE at<?", [now() - 86400])?;
+    c.execute("DELETE FROM chat_activity WHERE at<?", [now() - 300])?;
+    c.execute(
+        "DELETE FROM chat_space_invites WHERE created<?",
+        [now() - 30 * 86400],
+    )?;
+    c.execute("DELETE FROM chat_mutes WHERE until<?", [now()])?;
     c.execute(
         "DELETE FROM chat_events WHERE kind IN ('typing','receipt') AND at<?",
         [now() - 86400],
@@ -1837,7 +2031,7 @@ pub async fn push_loop(a: App) {
             let key = B64
                 .decode(setting(&c, "vapid")?.as_str().unwrap_or(""))
                 .map_err(|_| bad("Push unavailable"))?;
-            let mut q=c.prepare("SELECT MAX(n.id),p.endpoint FROM chat_notices n JOIN chat_push p ON p.user=n.user WHERE n.id>? AND n.at>? AND (EXISTS(SELECT 1 FROM sessions s WHERE s.hash=p.session AND s.expires>unixepoch()) OR EXISTS(SELECT 1 FROM chat_sessions s WHERE s.hash=p.session AND s.expires>unixepoch())) GROUP BY p.endpoint ORDER BY MAX(n.id) ASC LIMIT 128")?;
+            let mut q=c.prepare("SELECT MAX(n.id),p.endpoint FROM chat_notices n JOIN chat_push p ON p.user=n.user WHERE n.id>? AND n.at>? AND n.push_ok=1 AND NOT EXISTS(SELECT 1 FROM chat_activity a WHERE a.user=n.user AND a.at>unixepoch()-45 AND a.idle=0) AND (EXISTS(SELECT 1 FROM sessions s WHERE s.hash=p.session AND s.expires>unixepoch()) OR EXISTS(SELECT 1 FROM chat_sessions s WHERE s.hash=p.session AND s.expires>unixepoch())) GROUP BY p.endpoint ORDER BY MAX(n.id) ASC LIMIT 128")?;
             let rows = q
                 .query_map(params![cursor, now() - 60], |r| {
                     Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
@@ -1986,6 +2180,7 @@ async fn commons_gifs(client: &reqwest::Client, query: &str) -> Api<Json<Value>>
             ("gsrlimit", "12"),
             ("prop", "imageinfo"),
             ("iiprop", "url|mime|size|extmetadata"),
+            ("iiurlwidth", "240"),
         ])
         .send()
         .await
@@ -2004,7 +2199,7 @@ async fn commons_gifs(client: &reqwest::Client, query: &str) -> Api<Json<Value>>
         if info["mime"] != "image/gif" || info["size"].as_u64().unwrap_or(u64::MAX) > 16 * 1024 * 1024 || !allowed_gif_url(url) { return None; }
         let title = page["title"].as_str().unwrap_or("GIF").trim_start_matches("File:");
         let meta = &info["extmetadata"];
-        Some(json!({"title":title,"url":url,"preview":url,"source":info["descriptionurl"],"attribution":format!("{} — {} · {}",title,plain_metadata(meta["Artist"]["value"].as_str().unwrap_or("Wikimedia Commons")),plain_metadata(meta["LicenseShortName"]["value"].as_str().unwrap_or("See source for license")))}))
+        Some(json!({"title":title,"url":url,"preview":info["thumburl"].as_str().filter(|u|allowed_gif_url(u)).unwrap_or(url),"source":info["descriptionurl"],"attribution":format!("{} — {} · {}",title,plain_metadata(meta["Artist"]["value"].as_str().unwrap_or("Wikimedia Commons")),plain_metadata(meta["LicenseShortName"]["value"].as_str().unwrap_or("See source for license")))}))
     }).collect::<Vec<_>>()).unwrap_or_default();
     Ok(Json(json!({"items":items,"provider":"Wikimedia Commons"})))
 }
@@ -2013,7 +2208,8 @@ fn allowed_gif_url(raw: &str) -> bool {
         return false;
     };
     let host = url.host_str().unwrap_or("");
-    let provider = host == "media.giphy.com"
+    let provider = host == "i.giphy.com"
+        || host == "media.giphy.com"
         || (host.starts_with("media") && host.ends_with(".giphy.com") && host.len() < 24);
     let commons = host == "upload.wikimedia.org"
         && url.path().starts_with("/wikipedia/commons/")
@@ -2034,17 +2230,57 @@ pub async fn gif_file(State(a): State<App>, h: HeaderMap, Json(v): Json<Value>) 
     let url = reqwest::Url::parse(&raw).map_err(|_| bad("Invalid GIF"))?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(20))
+        .user_agent("VortexNode/1.0 (https://github.com/MagnetosphereLabs/VortexNode; self-hosted encrypted chat)")
+        .timeout(Duration::from_secs(30))
         .build()
         .map_err(|_| bad("GIF unavailable"))?;
-    let mut r = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| bad("GIF unavailable"))?;
-    if !r.status().is_success() {
-        return Err(bad("GIF unavailable"));
+    let out = fetch_gif_bytes(&client, url.as_str()).await?;
+    Ok(([(header::CONTENT_TYPE, "image/gif")], out).into_response())
+}
+async fn fetch_gif_bytes(client: &reqwest::Client, raw: &str) -> Api<Vec<u8>> {
+    if !allowed_gif_url(raw) {
+        return Err(bad("Unsupported GIF source"));
     }
+    let mut next = reqwest::Url::parse(raw).map_err(|_| bad("Invalid GIF"))?;
+    let mut redirects = 0;
+    let mut r = loop {
+        let response = client
+            .get(next.clone())
+            .send()
+            .await
+            .map_err(|_| bad("GIF provider could not be reached. Try again."))?;
+        if response.status().is_redirection() {
+            if redirects >= 3 {
+                return Err(bad("GIF provider redirected too many times"));
+            }
+            let location = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or(bad("GIF unavailable"))?;
+            let target = next
+                .join(location)
+                .map_err(|_| bad("Unsupported GIF source"))?;
+            if !allowed_gif_url(target.as_str()) {
+                return Err(bad("Unsupported GIF source"));
+            }
+            next = target;
+            redirects += 1;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(bad(
+                "GIF provider could not load this animation. Try another result or retry.",
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|n| n > 16 * 1024 * 1024)
+        {
+            return Err(bad("Choose a smaller GIF"));
+        }
+        break response;
+    };
     let mut out = Vec::new();
     while let Some(chunk) = r.chunk().await.map_err(|_| bad("GIF unavailable"))? {
         if out.len() + chunk.len() > 16 * 1024 * 1024 {
@@ -2055,7 +2291,7 @@ pub async fn gif_file(State(a): State<App>, h: HeaderMap, Json(v): Json<Value>) 
     if !(out.starts_with(b"GIF87a") || out.starts_with(b"GIF89a")) {
         return Err(bad("Unsupported image format"));
     }
-    Ok(([(header::CONTENT_TYPE, "image/gif")], out).into_response())
+    Ok(out)
 }
 pub async fn auth_script() -> Response {
     (
@@ -2511,5 +2747,247 @@ mod polish_tests {
             assert!(allowed_gif_url(item["url"].as_str().unwrap()));
             assert!(item["attribution"].as_str().unwrap().contains('·'));
         }
+        for item in items.iter().take(2) {
+            let bytes = fetch_gif_bytes(&client, item["preview"].as_str().unwrap())
+                .await
+                .unwrap();
+            assert!(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"));
+        }
+        let original = fetch_gif_bytes(&client, items[0]["url"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert!(original.len() > 6);
+    }
+    #[test]
+    fn presence_uses_each_tab_and_suppresses_push_when_any_instance_is_active() {
+        let (_dir, app, _owner, reader, _key, _owner_id, reader_id) = fixture();
+        run(
+            &app,
+            &reader,
+            json!({"action":"presence","instance":"foreground","idle":false}),
+        )
+        .unwrap();
+        run(
+            &app,
+            &reader,
+            json!({"action":"presence","instance":"background","idle":true}),
+        )
+        .unwrap();
+        {
+            let c = db(&app).unwrap();
+            assert!(active_now(&c, &reader_id).unwrap());
+            notify(&c, &reader_id, "message", "none").unwrap();
+            assert!(!c
+                .query_row(
+                    "SELECT push_ok FROM chat_notices ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap());
+        }
+        run(
+            &app,
+            &reader,
+            json!({"action":"presence","instance":"foreground","idle":true}),
+        )
+        .unwrap();
+        {
+            let c = db(&app).unwrap();
+            assert!(!active_now(&c, &reader_id).unwrap());
+            let entry = directory(&c)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|user| user["id"] == reader_id)
+                .unwrap()
+                .clone();
+            assert_eq!(entry["status"], "idle");
+            notify(&c, &reader_id, "message", "none").unwrap();
+            assert!(c
+                .query_row(
+                    "SELECT push_ok FROM chat_notices ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap());
+        }
+        run(&app, &reader, json!({"action":"logout"})).unwrap();
+        assert!(!active_now(&db(&app).unwrap(), &reader_id).unwrap());
+    }
+    #[test]
+    fn friend_requests_create_one_notice_and_muted_rooms_suppress_browser_push() {
+        let (_dir, app, owner, reader, _key, owner_id, reader_id) = fixture();
+        for _ in 0..2 {
+            run(
+                &app,
+                &owner,
+                json!({"action":"friend","user":reader_id,"kind":"request"}),
+            )
+            .unwrap();
+        }
+        let notices = run(&app, &reader, json!({"action":"notices","after":0})).unwrap();
+        assert_eq!(
+            notices["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|notice| notice["kind"] == "friend.request")
+                .count(),
+            1
+        );
+        let room = random(24);
+        {
+            let c = db(&app).unwrap();
+            c.execute("INSERT INTO chat_rooms(id,space,creator,kind,sealed,created) VALUES(?,'',?,'dm','sealed',?)",params![room,owner_id,now()]).unwrap();
+            c.execute(
+                "INSERT INTO chat_members(room,user,box) VALUES(?,?,'box')",
+                params![room, reader_id],
+            )
+            .unwrap();
+        }
+        run(
+            &app,
+            &reader,
+            json!({"action":"mute","scope":format!("room:{room}"),"until":now()+3600}),
+        )
+        .unwrap();
+        {
+            let c = db(&app).unwrap();
+            notify(&c, &reader_id, "message", &room).unwrap();
+            assert!(!c
+                .query_row(
+                    "SELECT push_ok FROM chat_notices ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap());
+        }
+        assert_eq!(
+            run(
+                &app,
+                &reader,
+                json!({"action":"mute","scope":"room:unjoined","until":now()+3600})
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    fn invite_fixture(app: &App, owner_id: &str, reader_id: &str) -> (String, String, Value) {
+        let space = random(24);
+        let room = random(24);
+        let base = B64.encode([1u8; 64]);
+        let c = db(app).unwrap();
+        c.execute(
+            "INSERT INTO chat_spaces(id,creator,sealed,created) VALUES(?,?,'sealed',?)",
+            params![space, owner_id, now()],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO chat_space_members(space,user,permissions) VALUES(?,?,255)",
+            params![space, owner_id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO chat_rooms(id,space,creator,kind,sealed,created) VALUES(?,?,?,'text',?,?)",
+            params![room, space, owner_id, base, now()],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO chat_members(room,user,box) VALUES(?,?,'box')",
+            params![room, owner_id],
+        )
+        .unwrap();
+        let body = json!({"rooms":[{"room":room,"creator":owner_id,"base":base,"box":B64.encode([2u8;64]),"sealed":B64.encode([3u8;64])}],"label":B64.encode([4u8;64]),"signature":B64.encode([5u8;64])});
+        assert_ne!(reader_id, owner_id);
+        (space, room, body)
+    }
+    #[test]
+    fn invitations_require_permission_and_recipient_acceptance_before_sharing_channels() {
+        let (_dir, app, owner, reader, _key, owner_id, reader_id) = fixture();
+        let (space, room, body) = invite_fixture(&app, &owner_id, &reader_id);
+        let id = random(24);
+        let request =
+            json!({"action":"space.invite","space":space,"id":id,"user":reader_id,"body":body});
+        assert_eq!(
+            run(&app, &reader, request.clone()).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        run(&app, &owner, request).unwrap();
+        assert_eq!(
+            run(&app, &reader, json!({"action":"events","room":room}))
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            run(
+                &app,
+                &owner,
+                json!({"action":"space.invite.respond","id":id,"accept":true})
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        run(
+            &app,
+            &reader,
+            json!({"action":"space.invite.respond","id":id,"accept":true}),
+        )
+        .unwrap();
+        assert!(run(&app, &reader, json!({"action":"events","room":room})).is_ok());
+        assert_eq!(
+            run(
+                &app,
+                &reader,
+                json!({"action":"space.invite.respond","id":id,"accept":true})
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    #[test]
+    fn stale_or_revoked_space_invitations_cannot_overwrite_membership_or_metadata() {
+        let (_dir, app, owner, reader, _key, owner_id, reader_id) = fixture();
+        let (space, room, body) = invite_fixture(&app, &owner_id, &reader_id);
+        let id = random(24);
+        run(
+            &app,
+            &owner,
+            json!({"action":"space.invite","space":space,"id":id,"user":reader_id,"body":body}),
+        )
+        .unwrap();
+        {
+            let c = db(&app).unwrap();
+            c.execute("UPDATE chat_rooms SET sealed='changed' WHERE id=?", [&room])
+                .unwrap();
+        }
+        assert!(run(
+            &app,
+            &reader,
+            json!({"action":"space.invite.respond","id":id,"accept":true})
+        )
+        .is_err());
+        let account = user(&app, &reader).unwrap();
+        assert!(member(&db(&app).unwrap(), &account, &room).is_err());
+        {
+            let c = db(&app).unwrap();
+            c.execute(
+                "UPDATE chat_rooms SET sealed=? WHERE id=?",
+                params![B64.encode([1u8; 64]), room],
+            )
+            .unwrap();
+            c.execute("UPDATE chat_users SET disabled=1 WHERE id=?", [owner_id])
+                .unwrap();
+        }
+        assert!(run(
+            &app,
+            &reader,
+            json!({"action":"space.invite.respond","id":id,"accept":true})
+        )
+        .is_err());
     }
 }
