@@ -11430,7 +11430,7 @@ function debounce(fn, ms=250){
   .unlockStepLabel{font-size:11px;color:#8896b7}
   .unlockStepLabel b{color:#dce6fa}
   .cryptoProgress{display:flex;flex-direction:column;align-items:center;text-align:center;padding:12px 8px 4px}
-  .cryptoOrb{width:58px;height:58px;border-radius:50%;position:relative;margin-bottom:16px;background:conic-gradient(from 0deg,#70b5ff,#8b72ff,#70b5ff);animation:cryptoSpin 1.2s linear infinite;box-shadow:0 0 34px rgba(112,181,255,.13)}
+  .cryptoOrb{width:58px;height:58px;border-radius:50%;position:relative;margin-bottom:16px;background:conic-gradient(from 0deg,transparent 0deg,rgba(112,181,255,.1) 65deg,#70b5ff 220deg,#a08aff 290deg,transparent 295deg);animation:cryptoSpin .9s linear infinite;box-shadow:0 0 34px rgba(112,181,255,.13)}
   .cryptoOrb::after{content:"";position:absolute;inset:5px;border-radius:50%;background:#0a0e19}
   @keyframes cryptoSpin{to{transform:rotate(360deg)}}
   .cryptoProgress .h{font-size:15px;font-weight:780;color:#edf3ff}
@@ -12411,15 +12411,15 @@ function debounce(fn, ms=250){
   <div class="modal">
     <div class="modalHead">
       <div>
-        <div class="h">Cascade Lock</div>
-        <div class="s" id="cascadeUnlockSub">Enter passphrase 1.</div>
+        <div class="h" id="cascadeUnlockTitle">Unlock vault</div>
+        <div class="s" id="cascadeUnlockSub">Enter your vault passphrase.</div>
       </div>
     </div>
     <div class="modalBody unlockStep">
       <div class="unlockSteps" id="cascadeUnlockSteps"></div>
       <div class="unlockStepLabel" id="cascadeUnlockLabel"><b>Passphrase 1</b> of 1</div>
       <input class="fieldInput" id="cascadeUnlockPassword" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Enter passphrase" />
-      <div class="vvFieldHint">Each step performs its own million-round derivation. No step reveals whether a passphrase was correct.</div>
+      <div class="vvFieldHint" id="cascadeUnlockHint">Your passphrase unlocks this vault on your device.</div>
     </div>
     <div class="modalFoot">
       <button class="btn ghost" id="cascadeUnlockCancel" type="button">Cancel</button>
@@ -12761,14 +12761,17 @@ function debounce(fn, ms=250){
     const s=U.unlockSession;
     if(!s) return;
     const total=s.hdr.cascadeCount;
-    q("cascadeUnlockSub").textContent=`${total}-passphrase Cascade Lock · exact order required`;
-    q("cascadeUnlockLabel").innerHTML=`<b>Passphrase ${s.index+1}</b> of ${total}`;
+    q("cascadeUnlockTitle").textContent=total>1?"Cascade Lock":"Unlock vault";
+    q("cascadeUnlockSub").textContent=total>1?`${total}-passphrase Cascade Lock · exact order required`:"Enter your vault passphrase.";
+    q("cascadeUnlockLabel").innerHTML=total>1?`<b>Passphrase ${s.index+1}</b> of ${total}`:"<b>Passphrase</b>";
+    q("cascadeUnlockHint").textContent=total>1?"Each step performs its own million-round derivation. Passphrases are verified together after the final step.":"Your passphrase unlocks this vault on your device.";
+    q("cascadeUnlockSteps").hidden=total===1;
     q("cascadeUnlockSteps").innerHTML="";
     for(let i=0;i<total;i++){
       q("cascadeUnlockSteps").appendChild(make("span",i<s.index?"done":i===s.index?"on":""));
     }
     q("cascadeUnlockGo").textContent=s.index===total-1?"Unlock vault":"Continue";
-    q("cascadeUnlockPassword").placeholder=`Passphrase ${s.index+1}`;
+    q("cascadeUnlockPassword").placeholder=total>1?`Passphrase ${s.index+1}`:"Enter passphrase";
     q("cascadeUnlockPassword").value="";
     setTimeout(()=>q("cascadeUnlockPassword").focus(),30);
   }
@@ -12813,7 +12816,7 @@ function debounce(fn, ms=250){
         return;
       }
 
-      showCryptoProgress("Authenticating vault","All passphrase steps completed. Verifying AES-GCM authentication…",92);
+      showCryptoProgress("Authenticating vault",s.hdr.cascadeCount>1?"All passphrases entered. Verifying your vault…":"Verifying your vault passphrase…",92);
       const material=await cascadeFinalizeKeyMaterial(s.chain,s.hdr.vaultId,s.hdr.cascadeCount);
       const key=material.key;
       rawVaultKey=material.raw;
@@ -12830,7 +12833,7 @@ function debounce(fn, ms=250){
       render();
       refreshMediaCount();
       if(window.VortexVaultSecureWorkspace) window.VortexVaultSecureWorkspace.setWorkspace("files");
-      toast("Cascade Lock verified · vault unlocked");
+      toast(s.hdr.cascadeCount>1?"Cascade Lock verified · vault unlocked":"Vault unlocked");
       await privacyShieldAfterVaultUnlocked(rawVaultKey);
       rawVaultKey=null;
     }catch(e){
@@ -13988,6 +13991,10 @@ window.VortexNode=(()=>{
  const ICONS={cloud:'<path d="M7 18a5 5 0 0 1-.5-10 6 6 0 0 1 11.4 1.4A4.4 4.4 0 0 1 18 18H7Z"/>',vault:'<rect x="4" y="3" width="16" height="18" rx="3"/><circle cx="12" cy="12" r="4"/><path d="M12 8v8m-4-4h8M7 6h.01M17 18h.01"/>',plus:'<path d="M12 5v14M5 12h14"/>',download:'<path d="M12 3v12m-4-4 4 4 4-4M4 17v4h16v-4"/>',arrow:'<path d="M5 12h14m-5-5 5 5-5 5"/>',check:'<path d="m5 12 4 4L19 6"/>',logout:'<path d="M9 4H5v16h4M10 12h11m-4-4 4 4-4 4"/>',activity:'<path d="M3 12h4l3-7 4 14 3-7h4"/>',user:'<circle cx="12" cy="7" r="3"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/>',clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',close:'<path d="m6 6 12 12M18 6 6 18"/>',shield:'<path d="m12 3 8 3v6c0 4-4 7-8 9-4-2-8-5-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/>'};
  function icon(name){const x=document.createElementNS('http://www.w3.org/2000/svg','svg');x.setAttribute('viewBox','0 0 24 24');x.setAttribute('fill','none');x.setAttribute('stroke','currentColor');x.setAttribute('stroke-width','1.6');x.setAttribute('stroke-linecap','round');x.setAttribute('stroke-linejoin','round');x.setAttribute('aria-hidden','true');x.innerHTML=ICONS[name]||ICONS.vault;return x}
  function action(label,name,fn,kind='',iconOnly=false){const b=button('',fn,kind);b.append(icon(name));if(!iconOnly)b.append(el('span','',label));b.title=label;b.setAttribute('aria-label',label);if(iconOnly)b.classList.add('nodeIconButton');return b}
+ function fitSelect(select){
+  const resize=()=>{if(!select.isConnected)return;const style=getComputedStyle(select),measure=document.createElement('span');measure.style.cssText='position:fixed;visibility:hidden;white-space:pre;pointer-events:none';for(const name of ['fontFamily','fontSize','fontWeight','fontStyle','letterSpacing'])measure.style[name]=style[name];measure.textContent=select.selectedOptions[0]?.textContent||'';document.body.append(measure);const width=measure.getBoundingClientRect().width;measure.remove();select.style.width=Math.ceil(width+parseFloat(style.paddingLeft)+parseFloat(style.paddingRight)+parseFloat(style.borderLeftWidth)+parseFloat(style.borderRightWidth))+'px';};
+  select.addEventListener('change',resize);requestAnimationFrame(resize);document.fonts?.ready.then(resize);return select;
+ }
  function sectionTitle(title,sub,name){const head=el('div','nodeSectionHead'),mark=el('span','nodeSectionIcon');mark.append(icon(name));const tx=el('div');tx.append(el('h3','',title));if(sub)tx.append(el('p','nodeHint',sub));head.append(mark,tx);return head}
  const headerOriginal={open:ui.btnOpen.innerHTML,openClick:ui.btnOpen.onclick,new:ui.btnNewVault.innerHTML,newClick:ui.btnNewVault.onclick,openTitle:ui.btnOpen.title,newTitle:ui.btnNewVault.title};
  function syncShell(){
@@ -14021,7 +14028,7 @@ window.VortexNode=(()=>{
    form.onsubmit=async e=>{e.preventDefault();go.disabled=true;const loginGeneration=window.VortexSession?.panicGeneration()||'',g=window.VortexSession?.generation()||0;try{if(Array.from(name.input.value).length<8||Array.from(name.input.value).length>128||Array.from(password.input.value).length<15||Array.from(password.input.value).length>128)throw Error('Use an 8–128 character username and a 15–128 character password');const origin=cleanOrigin(url.input.value.trim()),info=await(await W.request(origin+'/connect')).json();if(typeof info.gate!=='string'||!/^\/gate\/[A-Za-z0-9_-]{16,64}$/.test(info.gate)||typeof info.node!=='string'||!/^[A-Za-z0-9_-]{16,64}$/.test(info.node))throw Error('This address is not a compatible Vortex Node');const login=await W.json(origin+info.gate+'/session',{username:name.input.value,password:password.input.value,otp:otp.input.value,device:navigator.userAgent.slice(0,80)});password.input.value='';otp.input.value='';if(!/^[A-Za-z0-9_-]{43}$/.test(login.token)||!Number.isSafeInteger(login.expires))throw Error('Invalid Node session response');window.VortexSession?.assertGeneration(g);if(loginGeneration!==(window.VortexSession?.panicGeneration()||''))throw Error('Login cancelled by panic logout');webrtcCloseSession(true,true);N.pair={url:origin,gate:info.gate,node:info.node,token:login.token,expires:login.expires,username:login.username,months:login.months||12,loginGeneration};N.reachable=true;await storage('set',N.pair);window.VortexSession?.assertGeneration(g);await suspendShield();setStatus('Connected');window.VortexVaultUltra.refreshActiveFeature();if(visible()){N.pendingNew=!N.remote;await afterUnlock();await VortexSession.rememberCurrent()}else await picker(true)}catch(error){fail(error)}finally{go.disabled=false}};card.append(form);return inner;
   }
   const head=el('div','nodeAccountHead');const node=sectionTitle('Vortex Node',new URL(N.pair.url).host,'cloud');const signout=action('Disconnect Node','logout',disconnect,'ghost compact',true);head.append(node,signout);card.append(head);
-  const account=el('div','nodeAccountBody'),person=el('div','nodeIdentity'),avatar=el('span','nodeAvatar');avatar.append(icon('user'));const personText=el('div');personText.append(el('strong','',N.pair.username),el('span','nodeHint','Paired until '+new Date(N.pair.expires*1000).toLocaleDateString()));person.append(avatar,personText);const duration=el('label','nodeField nodeCompactField','Remember Node login'),months=el('select','fieldInput');months.id='nodeLoginMonths';for(let i=1;i<=12;i++){const option=el('option','',i===12?'1 year':i+' month'+(i===1?'':'s'));option.value=String(i);months.append(option)}months.value=String(N.pair.months||12);duration.append(months);account.append(person,duration);card.append(account);const pairingHelp=el('p','nodePairingHelp','Keeps this browser paired to your self-hosted Node for syncing. It does not unlock or decrypt your vault.');pairingHelp.id='nodePairingHelp';months.setAttribute('aria-describedby',pairingHelp.id);card.append(pairingHelp);months.onchange=async()=>{const pair=N.pair;months.disabled=true;try{const result=await api('/preferences',{months:Number(months.value)});if(N.pair!==pair)return;pair.months=result.months;pair.expires=result.expires;await storage('set',pair);if(result.expires*1000<=Date.now()){await VortexSession.panic();return}toast('Node login duration updated');window.VortexVaultUltra.refreshActiveFeature()}catch(e){fail(e)}finally{months.disabled=false}};
+  const account=el('div','nodeAccountBody'),person=el('div','nodeIdentity'),avatar=el('span','nodeAvatar');avatar.append(icon('user'));const personText=el('div');personText.append(el('strong','',N.pair.username),el('span','nodeHint','Paired until '+new Date(N.pair.expires*1000).toLocaleDateString()));person.append(avatar,personText);const duration=el('label','nodeField nodeCompactField','Remember Node login'),months=el('select','fieldInput');months.id='nodeLoginMonths';for(let i=1;i<=12;i++){const option=el('option','',i===12?'1 year':i+' month'+(i===1?'':'s'));option.value=String(i);months.append(option)}months.value=String(N.pair.months||12);fitSelect(months);duration.append(months);account.append(person,duration);card.append(account);const pairingHelp=el('p','nodePairingHelp','Keeps this browser paired to your self-hosted Node for syncing. It does not unlock or decrypt your vault.');pairingHelp.id='nodePairingHelp';months.setAttribute('aria-describedby',pairingHelp.id);card.append(pairingHelp);months.onchange=async()=>{const pair=N.pair;months.disabled=true;try{const result=await api('/preferences',{months:Number(months.value)});if(N.pair!==pair)return;pair.months=result.months;pair.expires=result.expires;await storage('set',pair);if(result.expires*1000<=Date.now()){await VortexSession.panic();return}toast('Node login duration updated');window.VortexVaultUltra.refreshActiveFeature()}catch(e){fail(e)}finally{months.disabled=false}};
   const vaults=el('section','settingsCard nodeVaultCard'),vh=el('div','nodeSectionActions');vh.append(sectionTitle('Your vaults','Open a vault or download an encrypted copy.','vault'),action('New vault','plus',newRemote,'compact'));vaults.append(vh);const list=el('div','nodeVaultList');list.dataset.nodeVaultList='';vaults.append(list);inner.append(vaults);fillVaults(list).catch(()=>list.append(el('p','nodeEmpty','Your vaults are unavailable while the Node is offline.')));
   const delivery=el('div','nodeTransfer');inner.append(delivery);loadTransfer(delivery).catch(()=>{});const audit=el('section','settingsCard nodeAudit');audit.append(sectionTitle('Recent activity','Last 24 hours · updates automatically','activity'));const logs=el('div','nodeAuditList');logs.id='nodeAuditList';audit.append(logs);inner.append(audit);loadLogs(logs).catch(()=>{logs.textContent='Activity is unavailable while your Node is offline.'});return inner;
  }
@@ -14137,7 +14144,7 @@ const record=state.v2.pendingRecords.has(it.id)?source(state.v2.pendingRecords.g
  window.addEventListener('online',()=>{if(N.pair&&N.remote)schedule(1000)});document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.dirty)schedule(500)});
  new MutationObserver(records=>{if(records.some(r=>r.type==='attributes'?r.target.matches?.('.overlay,.nodeOverlay,.mediaLightbox'):[...r.addedNodes,...r.removedNodes].some(n=>n.nodeType===1&&n.matches?.('.overlay,.nodeOverlay,.mediaLightbox'))))syncShell()}).observe(document.body,{subtree:true,childList:true,attributes:true,attributeFilter:['class']});
  setTimeout(syncShell,0);boot().catch(()=>{});
- return {api,syncShell,showLanding,icon,sectionTitle,picker,downloadRemote,proof:sign,ensureBinding,verifyVault,pairStorage:storage,privacyUnlock:originalUnlock,settingsCard,connected,decorateShare,startShare,save,afterUnlock,onLock,reencrypt,plainRecord,Composite,state:N,snapshot,blocks,visible};
+ return {api,syncShell,showLanding,icon,sectionTitle,fitSelect,picker,downloadRemote,proof:sign,ensureBinding,verifyVault,pairStorage:storage,privacyUnlock:originalUnlock,settingsCard,connected,decorateShare,startShare,save,afterUnlock,onLock,reencrypt,plainRecord,Composite,state:N,snapshot,blocks,visible};
 })();
 
 </script>
@@ -14186,7 +14193,7 @@ window.VortexSession=(()=>{
  }catch(e){if(g!==S.generation)throw e;await db('delete',id).catch(()=>{});return false}}
  async function checkLease(){const g=S.generation;if(!S.started||!N.pair||!N.remote||!S.lease||S.busy)return;if(!canUse())return;try{const r=await VortexNode.api('/vault/'+N.remote+'/remember/resume',{token:S.lease.token});assertGeneration(g);if(r.epoch!==S.epoch)throw Object.assign(Error('Vault session changed'),{status:401});const left=Math.max(0,r.expires-r.server_now)*1000;S.expires=Math.min(S.expires,Date.now()+left);S.untilPerf=Math.min(S.untilPerf,performance.now()+left);}catch(e){if(g===S.generation&&[401,403,423].includes(e.status))expire('Vault session ended. Enter your full passphrase again.')}}
  function expire(message){if(!S.started||S.ending)return;S.ending=true;forgetCurrent();hardLogout(false);toast(message,true);}
- function settingsCard(){const outer=document.createElement('div');outer.className='featureInner nodeSessionSettings';if(!state.unlocked||!state.v2.index)return outer;const card=document.createElement('section');card.className='settingsCard nodeSessionCard';outer.append(card);card.append(VortexNode.sectionTitle('Vault unlock','Choose when your full vault passphrase is required again.','clock'));const row=document.createElement('div');row.className='nodeSessionRow';const label=document.createElement('label');label.className='nodeField nodeCompactField';label.textContent='Keep this vault unlocked';const select=document.createElement('select');select.className='fieldInput';select.id='vaultUnlockDuration';const choices=[[0,'Immediately on leaving'],[86400,'24 hours'],[172800,'2 days'],[259200,'3 days'],[345600,'4 days'],[432000,'5 days'],[518400,'6 days'],[604800,'7 days']];const current=seconds();if(!choices.some(c=>c[0]===current))choices.splice(1,0,[current,'Custom duration']);for(const [value,text]of choices){const option=document.createElement('option');option.value=String(value);option.textContent=text;select.append(option)}select.value=String(current);label.append(select);const info=document.createElement('div');info.className='nodeSessionNote';const live=document.createElement('strong');live.textContent=current===0?'Locks when you leave':S.started?'Passphrase required '+new Date(S.expires).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'24 hours by default';const hint=document.createElement('span');hint.textContent='A fixed deadline. Activity never extends it.';info.append(live,hint);row.append(label,info);card.append(row);select.onchange=async()=>{const n=Number(select.value);if(!validSeconds(n))return;select.disabled=true;try{requireLive();state.v2.index.meta.unlockSeconds=n;state.dirty=true;S.seconds=n;S.expires=Math.min(S.expires,S.started+(n||MAX)*1000);S.untilPerf=Math.min(S.untilPerf,performance.now()+Math.max(0,S.expires-Date.now()));if(N.pair&&N.remote){await VortexNode.save();await rememberCurrent()}else if(n===0)forgetCurrent();schedule();live.textContent=n===0?'Locks when you leave':'Passphrase required '+new Date(S.expires).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});toast('Unlock duration updated. Longer durations begin after your next full unlock.')}catch(e){toast(e.message,true)}finally{select.disabled=false}};return outer;}
+ function settingsCard(){const outer=document.createElement('div');outer.className='featureInner nodeSessionSettings';if(!state.unlocked||!state.v2.index)return outer;const card=document.createElement('section');card.className='settingsCard nodeSessionCard';outer.append(card);card.append(VortexNode.sectionTitle('Vault unlock','Choose when your full vault passphrase is required again.','clock'));const row=document.createElement('div');row.className='nodeSessionRow';const label=document.createElement('label');label.className='nodeField nodeCompactField';label.textContent='Keep this vault unlocked';const select=document.createElement('select');select.className='fieldInput';select.id='vaultUnlockDuration';const choices=[[0,'Immediately on leaving'],[86400,'24 hours'],[172800,'2 days'],[259200,'3 days'],[345600,'4 days'],[432000,'5 days'],[518400,'6 days'],[604800,'7 days']];const current=seconds();if(!choices.some(c=>c[0]===current))choices.splice(1,0,[current,'Custom duration']);for(const [value,text]of choices){const option=document.createElement('option');option.value=String(value);option.textContent=text;select.append(option)}select.value=String(current);VortexNode.fitSelect(select);label.append(select);const info=document.createElement('div');info.className='nodeSessionNote';const live=document.createElement('strong');live.textContent=current===0?'Locks when you leave':S.started?'Passphrase required '+new Date(S.expires).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'24 hours by default';const hint=document.createElement('span');hint.textContent='A fixed deadline. Activity never extends it.';info.append(live,hint);row.append(label,info);card.append(row);select.onchange=async()=>{const n=Number(select.value);if(!validSeconds(n))return;select.disabled=true;try{requireLive();state.v2.index.meta.unlockSeconds=n;state.dirty=true;S.seconds=n;S.expires=Math.min(S.expires,S.started+(n||MAX)*1000);S.untilPerf=Math.min(S.untilPerf,performance.now()+Math.max(0,S.expires-Date.now()));if(N.pair&&N.remote){await VortexNode.save();await rememberCurrent()}else if(n===0)forgetCurrent();schedule();live.textContent=n===0?'Locks when you leave':'Passphrase required '+new Date(S.expires).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});toast('Unlock duration updated. Longer durations begin after your next full unlock.')}catch(e){toast(e.message,true)}finally{select.disabled=false}};return outer;}
  function wipeDOM(){document.getElementById('nodeOverlay')?.remove();document.querySelectorAll('input,textarea').forEach(i=>{if(!['button','submit','checkbox','radio','range'].includes(i.type))i.value=''});document.querySelectorAll('.overlay.on').forEach(i=>i.classList.remove('on'));}
  function localPanic(broadcast=true){const pair=N.pair;try{if(broadcast)localStorage.setItem(markerKey,W.b64(W.random(24)));localStorage.removeItem('vortex-node-pair')}catch{}knownPanic=panicGeneration();S.network.abort();S.network=new AbortController();reset();N.abort?.abort();N.share=null;N.pair=null;N.remote=null;N.keys=null;N.verified=false;try{webrtcCloseSession(true,true)}catch{}hardLogout(false);wipeDOM();db('clear').catch(()=>{});VortexNode.pairStorage('delete').catch(()=>{});if(broadcast)channel?.postMessage({panic:true});window.VortexVaultUltra?.refreshActiveFeature();return pair;}
  let panicRun=null;
@@ -14375,11 +14382,12 @@ window.VortexSession=(()=>{
 <style id="vortexRefinementStyles">
 /* Precise compact controls and complete, readable connection states. */
 header .controls #btnGuide{display:inline-flex!important;align-items:center!important;justify-content:center!important}
-@media(max-width:1100px){header .controls #btnGuide{position:relative}header .controls #btnGuide .vvBtnLabel{display:none}header .controls #btnGuide .vvBtnIcon{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);margin:0}}
-.vortexPaired .controls>.pill{flex-shrink:0;min-width:128px;max-width:none!important}
+@media(max-width:1100px){.vortexPaired header .controls #btnGuide .vvBtnLabel{display:none}}
+header .controls #btnNewVault{justify-content:center}
+.vortexPaired .controls>.pill{flex:0 0 auto;min-width:0;width:max-content!important;max-width:none!important;justify-self:start}
 .controls>.pill .nodeSyncBadge{flex:none!important;width:max-content!important;max-width:none;justify-content:flex-start!important}
 .controls>.pill .nodeSyncBadge>span{display:block!important;flex:none!important;overflow:visible!important;text-overflow:clip!important;white-space:nowrap!important}
-@media(max-width:760px){.vortexPaired header .controls{grid-template-columns:minmax(128px,1fr) repeat(4,36px)}}
+@media(max-width:760px){.vortexPaired header .controls{grid-template-columns:max-content repeat(4,36px);justify-content:flex-end}}
 body:not(.vortexPaired) #vortexPanic{display:none!important}
 .vortexPanicSaving .shell,.vortexPanicSaving .mediaLightbox{pointer-events:none}
 .vortexPanicSaving #vortexPanic{pointer-events:auto;animation:nodeBreathe .9s ease-in-out infinite}
@@ -14399,7 +14407,11 @@ body:not(.vortexPaired) #vortexPanic{display:none!important}
 #settingsHub>.settingsLockedInfo{padding-top:18px;padding-bottom:26px}
 .settingsLockedInfo .settingsCard{padding:22px 24px}
 .nodeUnpairedView .settingsLockedInfo .nodeSectionIcon{width:36px;height:36px;flex-basis:36px}
-@media(max-width:680px){.nodeLocalActions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:18px}.nodeLocalActions .btn{padding:9px 6px;font-size:10.5px}.nodePairingHelp{font-size:10.5px!important}.settingsLockedInfo .settingsCard{padding:18px}.vortexPaired .controls>.pill{min-width:128px}}
+@media(max-width:680px){.nodeLocalActions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:18px}.nodeLocalActions .btn{padding:9px 6px;font-size:10.5px}.nodePairingHelp{font-size:10.5px!important}.settingsLockedInfo .settingsCard{padding:18px}.vortexPaired .controls>.pill{min-width:0}}
+
+/* Duration controls follow their selected text, rather than their label width. */
+.nodeSessionRow .nodeCompactField{width:auto;max-width:100%}
+#vaultUnlockDuration,#nodeLoginMonths{appearance:none;-webkit-appearance:none;align-self:flex-start;flex:none;width:auto;min-width:0;max-width:100%;padding-left:12px;padding-right:32px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='m1 1 4 4 4-4' fill='none' stroke='%23a3b0ce' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;background-size:10px 6px}
 @media(prefers-reduced-motion:reduce){.vortexPanicSaving #vortexPanic{animation:none!important}}
 
 </style>
