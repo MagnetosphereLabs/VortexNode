@@ -186,7 +186,10 @@ fi
 python3 - "$CONFIG" "$REPOSITORY" "$DOMAIN" "$EMAIL" "$LISTEN" "$NODE_ID" "$BRIDGE" <<'PY'
 import json,os,sys
 path,repo,domain,email,listen,node,bridge=sys.argv[1:]
+previous=json.load(open(path)) if os.path.exists(path) else {}
 c=dict(repository=repo,domain=domain,email=email,listen=listen,node_id=node,bridge=bridge,data_dir='/var/lib/vortex-node',vault_html='/opt/vortex-node/current/vault.html',reserve_bytes=10_000_000_000)
+for key in ('media','media_ports'):
+ if key in previous:c[key]=previous[key]
 tmp=path+'.new'
 with open(tmp,'w') as f:json.dump(c,f)
 os.chmod(tmp,0o640);os.replace(tmp,path)
@@ -217,6 +220,15 @@ limit=min(ram*7//10,ram-2*gib) if ram>=4*gib else ram*7//10
 print(limit*85//100,limit)
 PY_MEMORY
 )
+. "$SOURCE/media/setup.sh"
+prepare_media
+python3 - "$CONFIG" "$WORK/media.json" <<'PY_MEDIA'
+import json,sys,os
+p=sys.argv[1];c=json.load(open(p));c.update(json.load(open(sys.argv[2])));tmp=p+".new"
+with open(tmp,"w") as f:json.dump(c,f)
+os.chmod(tmp,0o640);os.replace(tmp,p)
+PY_MEDIA
+chown root:vortex-node "$CONFIG"
 cat > /etc/systemd/system/vortex-node.service <<EOF
 [Unit]
 Description=Vortex Node encrypted storage and relay
@@ -225,6 +237,7 @@ After=network.target vortex-node.socket
 [Service]
 User=vortex-node
 Group=vortex-node
+Slice=vortex-node.slice
 ExecStart=/opt/vortex-node/current/vortex-node serve --config /etc/vortex-node.json
 Restart=on-failure
 RestartSec=3
@@ -245,10 +258,6 @@ CapabilityBoundingSet=
 ReadWritePaths=/var/lib/vortex-node
 LimitNOFILE=4096
 TasksMax=128
-CPUQuota=$CPU_BUDGET%
-MemoryHigh=$MEMORY_HIGH
-MemoryMax=$MEMORY_MAX
-MemorySwapMax=0
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -260,6 +269,7 @@ write_http_site() {
 cat > "$SITE" <<EOF
 limit_conn_zone \$binary_remote_addr zone=vortex_peer:1m;
 limit_conn_zone \$server_name zone=vortex_host:1m;
+limit_req_zone \$binary_remote_addr zone=vortex_media_requests:1m rate=20r/s;
 server {
     listen 80;
     $IPV6_HTTP
@@ -288,12 +298,24 @@ server {
     server_tokens off;
     access_log off;
     error_log /var/log/nginx/vortex-node-error.log warn;
-    limit_conn vortex_peer 32;
-    limit_conn vortex_host 128;
+    limit_conn vortex_peer 128;
+    limit_conn vortex_host 1024;
     client_max_body_size 17m;
     client_body_timeout 30s;
     send_timeout 60s;
     add_header Strict-Transport-Security "max-age=15552000" always;
+    location ^~ /chat/relay/ {
+        limit_req zone=vortex_media_requests burst=100 nodelay;
+        limit_req_status 429;
+        proxy_pass http://127.0.0.1:$MEDIA_HTTP/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_read_timeout 3600s;
+        proxy_buffering off;
+    }
     location / {
         proxy_pass http://$LISTEN;
         proxy_http_version 1.1;
@@ -308,11 +330,18 @@ server {
 }
 EOF
 nginx -t
+media_certificates
 install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
 cat > /etc/letsencrypt/renewal-hooks/deploy/vortex-node <<'EOF'
 #!/bin/sh
 set -eu
 /usr/sbin/nginx -t && /bin/systemctl reload nginx
+expected_domain=$(python3 -c 'import json;print(json.load(open("/etc/vortex-node.json"))["domain"])')
+if [ "${RENEWED_LINEAGE:-}" = "/etc/letsencrypt/live/$expected_domain" ] && [ -d /var/lib/vortex-node/media-certs ]; then
+ install -m 600 -o vortex-node -g vortex-node "$RENEWED_LINEAGE/fullchain.pem" /var/lib/vortex-node/media-certs/fullchain.pem
+ install -m 600 -o vortex-node -g vortex-node "$RENEWED_LINEAGE/privkey.pem" /var/lib/vortex-node/media-certs/privkey.pem
+ /bin/systemctl try-restart vortex-media.service
+fi
 EOF
 chmod 755 /etc/letsencrypt/renewal-hooks/deploy/vortex-node
 systemctl enable --now certbot.timer
@@ -330,19 +359,26 @@ then
 fi
 systemctl daemon-reload
 systemctl enable --now vortex-node.socket
-systemctl enable vortex-node.service
+systemctl enable vortex-node.service vortex-media.service
 PUBLISHED=1
-systemctl restart vortex-node.service
+systemctl restart vortex-node.service vortex-media.service
 systemctl reload nginx
 for attempt in $(seq 1 30); do
   if curl -fsS --max-time 2 "http://$LISTEN/health" >/dev/null; then break; fi
   [[ $attempt != 30 ]] || { echo 'Node health check failed. Review journalctl -u vortex-node.' >&2; exit 1; }
   sleep 1
 done
+for attempt in $(seq 1 20); do
+  if curl -fsS --max-time 2 "http://127.0.0.1:$MEDIA_HTTP/" >/dev/null; then break; fi
+  [[ $attempt != 20 ]] || { echo 'Chat media relay health check failed. Review journalctl -u vortex-media.' >&2; exit 1; }
+  sleep 1
+done
 SUCCESS=1
 echo
 echo "Vortex Node is ready: https://$DOMAIN"
-echo "Vortex Vault:         https://$DOMAIN/vault/"
+echo "Vortex:               https://$DOMAIN"
+echo "Chat:                 https://$DOMAIN/chat/"
+echo "Media firewall ports: UDP $MEDIA_UDP, $MEDIA_TURN_UDP; TCP $MEDIA_TCP, $MEDIA_TURN_TLS"
 echo 'Manual update:       sudo /opt/vortex-node/install.sh update'
 echo 'Uninstall:           sudo /opt/vortex-node/uninstall.sh'
 

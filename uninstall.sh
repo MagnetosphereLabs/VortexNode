@@ -5,8 +5,9 @@ umask 077
 [[ $# -eq 0 || "${1:-}" == --delete-data ]] || { echo 'Usage: uninstall.sh [--delete-data]' >&2; exit 1; }
 exec 9>/run/vortex-node-install.lock
 flock -n 9 || { echo 'An installation or update is running.' >&2; exit 1; }
-systemctl disable --now vortex-node.service vortex-node.socket 2>/dev/null || true
-rm -f /etc/systemd/system/vortex-node.service /etc/systemd/system/vortex-node.socket
+systemctl disable --now vortex-node.service vortex-node.socket vortex-media.service 2>/dev/null || true
+rm -f /etc/systemd/system/vortex-node.service /etc/systemd/system/vortex-node.socket /etc/systemd/system/vortex-media.service /etc/systemd/system/vortex-node.slice
+rm -f /etc/vortex-node-media.yaml
 systemctl daemon-reload
 rm -f /etc/nginx/conf.d/vortex-node.conf /etc/letsencrypt/renewal-hooks/deploy/vortex-node
 if command -v nginx >/dev/null; then nginx -t && systemctl reload nginx; fi
