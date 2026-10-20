@@ -889,6 +889,8 @@ mod tests {
             .unwrap();
         let a = Arc::new(Inner {
             cfg: Config {
+                media:None,
+                email:default_email(),
                 listen: "127.0.0.1:0".into(),
                 data_dir: dir.path().to_owned(),
                 vault_html: dir.path().join("unused.html"),
@@ -898,6 +900,10 @@ mod tests {
             },
             db: Mutex::new(c),
             rates: Mutex::new(HashMap::new()),
+            traffic:Mutex::new(traffic::Traffic::default()),
+            public_slots:Arc::new(tokio::sync::Semaphore::new(24)),
+            chat_stream_slots:Arc::new(tokio::sync::Semaphore::new(256)),
+            chat_events:tokio::sync::broadcast::channel(256).0,
             auth_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             io_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             request_slots: Arc::new(tokio::sync::Semaphore::new(16)),

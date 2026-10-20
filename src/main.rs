@@ -1,6 +1,8 @@
 //! The service only handles ciphertext. Signing keys are verification-only.
 mod store;
 mod export;
+mod chat;
+mod traffic;
 use anyhow::{Context, Result};
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::{
@@ -47,6 +49,10 @@ const UPLOAD_SECONDS: i64 = 24 * 60 * 60;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {
+    #[serde(default = "default_email")]
+    email: String,
+    #[serde(default)]
+    media: Option<chat::Media>,
     listen: String,
     data_dir: PathBuf,
     vault_html: PathBuf,
@@ -55,6 +61,7 @@ struct Config {
     #[serde(default = "default_floor")]
     reserve_bytes: u64,
 }
+fn default_email()->String{"security@localhost.invalid".into()}
 fn default_floor() -> u64 {
     FLOOR
 }
@@ -66,6 +73,10 @@ struct Inner {
     io_slots: Arc<tokio::sync::Semaphore>,
     request_slots: Arc<tokio::sync::Semaphore>,
     gc: Mutex<GcCursor>,
+    traffic: Mutex<traffic::Traffic>,
+    public_slots: Arc<tokio::sync::Semaphore>,
+    chat_stream_slots: Arc<tokio::sync::Semaphore>,
+    chat_events: tokio::sync::broadcast::Sender<String>,
 }
 type App = Arc<Inner>;
 #[derive(Clone)]
@@ -289,8 +300,9 @@ fn reserve(c: &Connection, app: &App, additional: u64) -> Api<()> {
         [],
         |r| r.get(0),
     )?;
+    let chat_pending:i64=c.query_row("SELECT COALESCE(SUM(MAX(0,bytes-stored)),0) FROM chat_objects WHERE complete=0",[],|r|r.get(0))?;
     if free_bytes(&app.cfg.data_dir)?
-        .saturating_sub((a.max(0) as u64).saturating_add(b.max(0) as u64).saturating_add(jobs.max(0) as u64))
+        .saturating_sub((a.max(0) as u64).saturating_add(b.max(0) as u64).saturating_add(jobs.max(0) as u64).saturating_add(chat_pending.max(0) as u64))
         .saturating_sub(additional)
         < safety_floor(app)
     {
@@ -339,6 +351,7 @@ fn initialize(path: &Path) -> Result<Connection> {
  }
     store::initialize(&c)?;
     export::initialize(&c)?;
+    chat::initialize(&c)?;
     Ok(c)
 }
 
@@ -376,6 +389,7 @@ async fn login(
         return Err(bad("Invalid credentials"));
     }
     let username = normalize_name(&v.username);
+    if db(&a)?.query_row("SELECT 1 FROM chat_users WHERE username=? AND node_owner IS NOT NULL",[&username],|_|Ok(())).optional()?.is_some(){v.password.zeroize();return Err(bad("Use the updated Vortex client to sign in"));}
     rate(&a, format!("account:{}", hash(&username)), 15)?;
     let row = db(&a)?
         .query_row(
@@ -1641,10 +1655,6 @@ async fn gate_guard(
     }
     next.run(request).await
 }
-async fn admission(State(a):State<App>,request:axum::extract::Request,next:axum::middleware::Next)->Response {
-    let permit=match a.request_slots.clone().try_acquire_owned(){Ok(p)=>p,Err(_)=>return Fault(StatusCode::SERVICE_UNAVAILABLE,"Storage busy; retry shortly").into_response()};
-    let result=next.run(request).await;drop(permit);result
-}
 fn router(a: App) -> Router {
     let gate = format!("/gate/{}", a.cfg.bridge);
     let routes = Router::new()
@@ -1694,7 +1704,21 @@ fn router(a: App) -> Router {
         .route("/connect", get(info))
         .route("/health", get(health))
         .route("/download/{ticket}", get(export::download))
-        .route("/", get(receive_html))
+        .route("/", get(vault_html))
+        .route("/chat", get(chat::html))
+        .route("/chat/", get(chat::html))
+        .route("/chat/action", post(chat::action).layer(DefaultBodyLimit::max(2*1024*1024)))
+        .route("/chat/stream", get(chat::stream))
+        .route("/chat/auth.js", get(chat::auth_script))
+        .route("/chat/gifs", post(chat::gifs).layer(DefaultBodyLimit::max(4096)))
+        .route("/chat/gif-file", post(chat::gif_file).layer(DefaultBodyLimit::max(8192)))
+        .route("/chat/media", post(chat::media_token).layer(DefaultBodyLimit::max(4096)))
+        .route("/chat/objects", post(chat::begin_object).layer(DefaultBodyLimit::max(4096)))
+        .route("/chat/object/{id}/{n}", put(chat::object_part).get(chat::get_object).layer(DefaultBodyLimit::max(MAX_BLOCK)))
+        .route("/chat/object/{id}/finish", post(chat::finish_object))
+        .route("/chat/worker.js", get(chat::sw))
+        .route("/chat/manifest.webmanifest", get(chat::manifest))
+        .route("/chat/icon.svg", get(chat::icon))
         .route("/receive/", get(receive_html))
         .route("/receive/{id}", get(receive_html))
         .route("/receive/worker.js", get(worker))
@@ -1716,7 +1740,7 @@ fn router(a: App) -> Router {
         .route("/vault/", get(vault_html))
         .route("/Vault", get(vault_html))
         .nest(&gate, routes)
-        .layer(axum::middleware::from_fn_with_state(a.clone(),admission))
+        .layer(axum::middleware::from_fn_with_state(a.clone(),traffic::guard))
         .layer(DefaultBodyLimit::max(2 * MAX_MANIFEST + 65536))
         .layer(
             CorsLayer::new()
@@ -1953,7 +1977,11 @@ async fn run() -> Result<()> {
         rates: Mutex::new(HashMap::new()),
         auth_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         io_slots: Arc::new(tokio::sync::Semaphore::new(8)),
-        request_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+        request_slots: Arc::new(tokio::sync::Semaphore::new(96)),
+        public_slots: Arc::new(tokio::sync::Semaphore::new(24)),
+        chat_stream_slots: Arc::new(tokio::sync::Semaphore::new(256)),
+        chat_events: tokio::sync::broadcast::channel(256).0,
+        traffic: Mutex::new(traffic::Traffic::default()),
         gc: Mutex::new(GcCursor::default()),
     });
     {
@@ -1961,6 +1989,7 @@ async fn run() -> Result<()> {
         cleanup(&mut c, &a).map_err(|_| anyhow::anyhow!("Recovery failed"))?;
         gc_blocks(&c, &a).map_err(|_| anyhow::anyhow!("Storage reconciliation failed"))?;
     }
+    tokio::spawn(chat::push_loop(a.clone()));
     let maintenance = a.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -1970,6 +1999,7 @@ async fn run() -> Result<()> {
             if let Ok(mut c) = maintenance.db.lock() {
                 if last_cleanup.elapsed()>=Duration::from_secs(60){
                     let _ = cleanup(&mut c, &maintenance);
+                    let _ = chat::cleanup(&c, &maintenance);
                     let _ = prune_history(&mut c, &maintenance, false);
                     last_cleanup=Instant::now();
                 }
