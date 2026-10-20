@@ -12,6 +12,7 @@ axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hmac = "0.12"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 libc = "0.2"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 qrcode = { version = "0.14", default-features = false }
