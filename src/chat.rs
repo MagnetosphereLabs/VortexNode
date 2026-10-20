@@ -109,7 +109,8 @@ fn room_permission(c: &Connection, u: &User, room: &str, bit: i64) -> Api<()> {
         [room],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    if creator == u.id || !space.is_empty() && permission(c, u, &space, bit)? {
+    if creator == u.id || u.owner && bit == 8 || !space.is_empty() && permission(c, u, &space, bit)?
+    {
         Ok(())
     } else {
         Err(denied())
@@ -128,6 +129,38 @@ fn ciphertext(v: &Value, k: &str, max: usize) -> Api<String> {
         return Err(bad("Encrypted data required"));
     }
     Ok(B64.encode(b))
+}
+// The catalog contains signed ciphertext and encrypted per-account key boxes only.
+fn node_emoji_audience(id: &str, creator: &str, envelope: &Value) -> Api<Vec<String>> {
+    let raw = text(envelope, "data");
+    if raw.len() > 1800 * 1024 {
+        return Err(bad("Emoji catalog entry is too large"));
+    }
+    let data: Value = serde_json::from_str(&raw).map_err(|_| bad("Invalid encrypted emoji"))?;
+    if text(&data, "id") != id || data["version"] != 1 {
+        return Err(bad("Invalid emoji context"));
+    }
+    if decode(envelope, "signature", 256)?.len() != 64 {
+        return Err(bad("Invalid emoji signature"));
+    }
+    ciphertext(&data, "cipher", 512 * 1024)?;
+    let boxes = data["boxes"]
+        .as_object()
+        .ok_or(bad("Encrypted account keys are required"))?;
+    if boxes.is_empty() || boxes.len() > 4096 || !boxes.contains_key(creator) {
+        return Err(bad("Invalid emoji audience"));
+    }
+    for (user, value) in boxes {
+        if !valid_id(user)
+            || value
+                .as_str()
+                .map(|s| s.len() < 28 || s.len() > 4096)
+                .unwrap_or(true)
+        {
+            return Err(bad("Invalid encrypted account key"));
+        }
+    }
+    Ok(boxes.keys().cloned().collect())
 }
 fn devices(c: &Connection, id: &str) -> Api<Value> {
     let mut q=c.prepare("SELECT id,certificate,key_package FROM chat_devices WHERE user=? AND revoked=0 ORDER BY created")?;
@@ -179,6 +212,7 @@ pub fn initialize(c: &Connection) -> Result<()> {
  CREATE INDEX IF NOT EXISTS chat_notice_user ON chat_notices(user,id);
  CREATE TABLE IF NOT EXISTS chat_login_policy(user TEXT PRIMARY KEY,months INTEGER NOT NULL CHECK(months BETWEEN 1 AND 12));
  CREATE TABLE IF NOT EXISTS chat_preferences(user TEXT PRIMARY KEY,body TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS chat_node_emoji(id TEXT PRIMARY KEY,creator TEXT NOT NULL,body TEXT NOT NULL,audience TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS chat_presence(user TEXT PRIMARY KEY,at INTEGER NOT NULL,idle INTEGER NOT NULL);
  CREATE INDEX IF NOT EXISTS chat_object_sender ON chat_objects(sender);
  CREATE INDEX IF NOT EXISTS chat_object_room ON chat_objects(room);
@@ -280,6 +314,8 @@ pub async fn action(
         "notices",
         "auth.config",
         "presence",
+        "emoji.list",
+        "emoji.get",
     ]
     .contains(&name.as_str());
     let room = text(&v, "room");
@@ -560,6 +596,89 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
     let u = user(a, h)?;
     let mut c = db(a)?;
     match op.as_str() {
+        "emoji.list" => {
+            let mut q = c.prepare(
+                "SELECT id,creator,body,audience FROM chat_node_emoji ORDER BY id LIMIT 128",
+            )?;
+            let items = q.query_map([], |r| {
+                let body: String = r.get(2)?;
+                let audience: String = r.get(3)?;
+                let recipients = serde_json::from_str::<Vec<String>>(&audience).unwrap_or_default();
+                Ok(json!({"id":r.get::<_,String>(0)?,"creator":r.get::<_,String>(1)?,"version":hash(&body),"ready":recipients.contains(&u.id),"recipients":if u.owner { json!(recipients) } else { Value::Null }}))
+            })?.collect::<std::result::Result<Vec<_>,_>>()?;
+            Ok(json!({"items":items}))
+        }
+        "emoji.get" => {
+            let (body, audience): (String, String) = c
+                .query_row(
+                    "SELECT body,audience FROM chat_node_emoji WHERE id=?",
+                    [text(&v, "id")],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?
+                .ok_or(bad("Emoji is unavailable"))?;
+            let recipients = serde_json::from_str::<Vec<String>>(&audience).unwrap_or_default();
+            if !u.owner && !recipients.contains(&u.id) {
+                return Err(conflict());
+            }
+            Ok(
+                json!({"body":serde_json::from_str::<Value>(&body).unwrap_or(Value::Null),"version":hash(&body)}),
+            )
+        }
+        "emoji.publish" => {
+            owner(&u)?;
+            let id = text(&v, "id");
+            if !valid_id(&id) {
+                return Err(bad("Invalid emoji"));
+            }
+            let body = v["body"].to_string();
+            let audience = node_emoji_audience(&id, &u.id, &v["body"])?;
+            let identity: String =
+                c.query_row("SELECT identity FROM chat_users WHERE id=?", [&u.id], |r| {
+                    r.get(0)
+                })?;
+            let identity: Value =
+                serde_json::from_str(&identity).map_err(|_| bad("Invalid publisher identity"))?;
+            let public = decode(&identity, "sign", 128)?;
+            let public = VerifyingKey::from_sec1_bytes(&public)
+                .map_err(|_| bad("Invalid publisher identity"))?;
+            let signature = decode(&v["body"], "signature", 256)?;
+            let signature =
+                Signature::from_slice(&signature).map_err(|_| bad("Invalid emoji signature"))?;
+            public
+                .verify(text(&v["body"], "data").as_bytes(), &signature)
+                .map_err(|_| bad("Emoji signature could not be verified"))?;
+            let old: Option<String> = c
+                .query_row("SELECT body FROM chat_node_emoji WHERE id=?", [&id], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            if old.as_ref().map(|b| hash(b)).unwrap_or_default() != text(&v, "version") {
+                return Err(conflict());
+            }
+            if old.is_none()
+                && c.query_row("SELECT COUNT(*) FROM chat_node_emoji", [], |r| {
+                    r.get::<_, i64>(0)
+                })? >= 128
+            {
+                return Err(bad("This Node has 128 custom emoji"));
+            }
+            let used: i64 = c.query_row(
+                "SELECT COALESCE(SUM(length(body)),0) FROM chat_node_emoji WHERE id!=?",
+                [&id],
+                |r| r.get(0),
+            )?;
+            if used + body.len() as i64 > 64 * 1024 * 1024 {
+                return Err(bad("The Node emoji catalog is full"));
+            }
+            c.execute("INSERT INTO chat_node_emoji VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET creator=excluded.creator,body=excluded.body,audience=excluded.audience", params![id,u.id,body,json!(audience).to_string()])?;
+            Ok(json!({"ok":true,"version":hash(&body)}))
+        }
+        "emoji.delete" => {
+            owner(&u)?;
+            c.execute("DELETE FROM chat_node_emoji WHERE id=?", [text(&v, "id")])?;
+            Ok(json!({"ok":true}))
+        }
         "me" => {
             let (bundle, name, identity, totp): (String, String, String, String) = c.query_row(
                 "SELECT bundle,username,identity,totp FROM chat_users WHERE id=?",
@@ -873,11 +992,33 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             if !bounded(&title, 1, 80) {
                 return Err(bad("Invalid name"));
             }
+            let tx = c.transaction()?;
+            if let Some(people) = v.get("spaceCreators") {
+                let people = people.as_array().ok_or(bad("Invalid Space creators"))?;
+                if people.len() > 4096 {
+                    return Err(bad("Too many Space creators"));
+                }
+                for person in people {
+                    let id = person.as_str().ok_or(bad("Invalid Space creator"))?;
+                    if tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_users WHERE id=? AND disabled=0 AND node_owner IS NULL)", [id], |r|r.get::<_,bool>(0))? == false { return Err(bad("Choose an active standard account")); }
+                }
+                tx.execute(
+                    "UPDATE chat_users SET can_space=0 WHERE node_owner IS NULL AND disabled=0",
+                    [],
+                )?;
+                for person in people {
+                    tx.execute(
+                        "UPDATE chat_users SET can_space=1 WHERE id=?",
+                        [person.as_str().unwrap_or_default()],
+                    )?;
+                }
+            }
             set(
-                &c,
+                &tx,
                 "policy",
                 &json!({"signupUntil":until,"createSpaces":create,"title":title,"ready":true}),
             )?;
+            tx.commit()?;
             Ok(json!({"ok":true}))
         }
         "invite" => {
@@ -1413,7 +1554,7 @@ pub async fn html() -> Response {
     let nonce = random(18);
     let html = include_str!("../Vortex Chat.html")
         .replace("<script>", &format!("<script nonce=\"{nonce}\">"));
-    let policy=format!("default-src 'none'; script-src 'nonce-{nonce}' 'wasm-unsafe-eval' blob:; style-src 'unsafe-inline'; img-src 'self' blob: data:; media-src blob:; connect-src https: wss: http://localhost:* http://127.0.0.1:*; worker-src 'self' blob:; manifest-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'");
+    let policy=format!("default-src 'none'; script-src 'nonce-{nonce}' 'wasm-unsafe-eval' blob:; style-src 'unsafe-inline'; img-src 'self' blob: data:; media-src blob: mediastream:; connect-src https: wss: http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*; worker-src 'self' blob:; manifest-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'");
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -1770,12 +1911,6 @@ pub async fn gifs(State(a): State<App>, h: HeaderMap, Json(v): Json<Value>) -> A
         let c = db(&a)?;
         setting(&c, "gif-key")?.as_str().unwrap_or("").to_owned()
     };
-    if key.is_empty() {
-        return Err(Fault(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The Node owner can enable GIF search in Settings",
-        ));
-    }
     let query = text(&v, "query");
     if query.len() > 256 {
         return Err(bad("Search is too long"));
@@ -1786,9 +1921,14 @@ pub async fn gifs(State(a): State<App>, h: HeaderMap, Json(v): Json<Value>) -> A
         "search"
     };
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("VortexNode/1.0 (self-hosted encrypted chat)")
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|_| bad("GIF search unavailable"))?;
+    if key.is_empty() {
+        return commons_gifs(&client, &query).await;
+    }
     let result: Value = client
         .get(format!("https://api.giphy.com/v1/gifs/{endpoint}"))
         .query(&[
@@ -1800,26 +1940,98 @@ pub async fn gifs(State(a): State<App>, h: HeaderMap, Json(v): Json<Value>) -> A
         .send()
         .await
         .map_err(|_| bad("GIF search unavailable"))?
+        .error_for_status()
+        .map_err(|_| bad("The GIF provider rejected the request. Check its API key or clear it to use Wikimedia Commons."))?
         .json()
         .await
         .map_err(|_| bad("GIF search unavailable"))?;
     let items=result["data"].as_array().map(|list|list.iter().map(|i|json!({"title":i["title"],"preview":i["images"]["fixed_width_small"]["url"],"url":i["images"]["original"]["url"]})).collect::<Vec<_>>()).unwrap_or_default();
-    Ok(Json(json!({"items":items})))
+    Ok(Json(json!({"items":items,"provider":"GIPHY"})))
+}
+fn plain_metadata(value: &str) -> String {
+    let mut out = String::new();
+    let mut tag = false;
+    for c in value.chars().take(4096) {
+        match c {
+            '<' => tag = true,
+            '>' => tag = false,
+            _ if !tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+async fn commons_gifs(client: &reqwest::Client, query: &str) -> Api<Json<Value>> {
+    let search = format!(
+        "filemime:image/gif {}",
+        if query.trim().is_empty() {
+            "animation"
+        } else {
+            query.trim()
+        }
+    );
+    let result: Value = client
+        .get("https://commons.wikimedia.org/w/api.php")
+        .query(&[
+            ("action", "query"),
+            ("format", "json"),
+            ("formatversion", "2"),
+            ("generator", "search"),
+            ("gsrnamespace", "6"),
+            ("gsrsearch", search.as_str()),
+            ("gsrlimit", "12"),
+            ("prop", "imageinfo"),
+            ("iiprop", "url|mime|size|extmetadata"),
+        ])
+        .send()
+        .await
+        .map_err(|_| bad("GIF search is temporarily unavailable"))?
+        .error_for_status()
+        .map_err(|_| bad("GIF search is temporarily unavailable"))?
+        .json()
+        .await
+        .map_err(|_| bad("GIF search is temporarily unavailable"))?;
+    if result.get("error").is_some() {
+        return Err(bad("GIF search is temporarily unavailable"));
+    }
+    let items = result["query"]["pages"].as_array().map(|pages| pages.iter().filter_map(|page| {
+        let info = &page["imageinfo"][0];
+        let url = info["url"].as_str()?;
+        if info["mime"] != "image/gif" || info["size"].as_u64().unwrap_or(u64::MAX) > 16 * 1024 * 1024 || !allowed_gif_url(url) { return None; }
+        let title = page["title"].as_str().unwrap_or("GIF").trim_start_matches("File:");
+        let meta = &info["extmetadata"];
+        Some(json!({"title":title,"url":url,"preview":url,"source":info["descriptionurl"],"attribution":format!("{} — {} · {}",title,plain_metadata(meta["Artist"]["value"].as_str().unwrap_or("Wikimedia Commons")),plain_metadata(meta["LicenseShortName"]["value"].as_str().unwrap_or("See source for license")))}))
+    }).collect::<Vec<_>>()).unwrap_or_default();
+    Ok(Json(json!({"items":items,"provider":"Wikimedia Commons"})))
+}
+fn allowed_gif_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or("");
+    let provider = host == "media.giphy.com"
+        || (host.starts_with("media") && host.ends_with(".giphy.com") && host.len() < 24);
+    let commons = host == "upload.wikimedia.org"
+        && url.path().starts_with("/wikipedia/commons/")
+        && url.path().to_ascii_lowercase().ends_with(".gif");
+    url.scheme() == "https"
+        && (provider || commons)
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
 }
 pub async fn gif_file(State(a): State<App>, h: HeaderMap, Json(v): Json<Value>) -> Api<Response> {
     gif_user(&a, &h).await?;
     let raw = text(&v, "url");
-    let url = reqwest::Url::parse(&raw).map_err(|_| bad("Invalid GIF"))?;
-    let host = url.host_str().unwrap_or("");
-    if url.scheme() != "https"
-        || !(host == "media.giphy.com"
-            || (host.starts_with("media") && host.ends_with(".giphy.com") && host.len() < 24))
-        || url.port().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
+    if !allowed_gif_url(&raw) {
         return Err(bad("Unsupported GIF source"));
     }
+    let url = reqwest::Url::parse(&raw).map_err(|_| bad("Invalid GIF"))?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
@@ -1840,7 +2052,7 @@ pub async fn gif_file(State(a): State<App>, h: HeaderMap, Json(v): Json<Value>) 
         }
         out.extend_from_slice(&chunk);
     }
-    if !out.starts_with(b"GIF8") {
+    if !(out.starts_with(b"GIF87a") || out.starts_with(b"GIF89a")) {
         return Err(bad("Unsupported image format"));
     }
     Ok(([(header::CONTENT_TYPE, "image/gif")], out).into_response())
@@ -1924,6 +2136,380 @@ async fn kick_media(a: &App, room: &str, target: &str) {
                     .send()
                     .await;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod polish_tests {
+    use super::*;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        App,
+        HeaderMap,
+        HeaderMap,
+        SigningKey,
+        String,
+        String,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let c = crate::initialize(dir.path()).unwrap();
+        let key = SigningKey::random(&mut OsRng);
+        let identity =
+            json!({"sign":B64.encode(key.verifying_key().to_encoded_point(false).as_bytes())})
+                .to_string();
+        let owner_id = random(24);
+        let reader_id = random(24);
+        c.execute(
+            "INSERT INTO accounts(id,username,password) VALUES(1,'owner.user','unused')",
+            [],
+        )
+        .unwrap();
+        for (id, name, owner) in [
+            (&owner_id, "owner.user", Some(1)),
+            (&reader_id, "reader.user", None),
+        ] {
+            c.execute("INSERT INTO chat_users(id,username,node_owner,registration,bundle,identity,display,created) VALUES(?,?,?,'unused','unused',?,?,?)", params![id,name,owner,identity,name,now()]).unwrap();
+        }
+        let owner_token = random(32);
+        let reader_token = random(32);
+        c.execute(
+            "INSERT INTO sessions VALUES(?,1,?,?,'test')",
+            params![hash(&owner_token), now() + 3600, now()],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO chat_sessions VALUES(?,?,'test',?,?)",
+            params![hash(&reader_token), reader_id, now() + 3600, now()],
+        )
+        .unwrap();
+        let app = Arc::new(Inner {
+            cfg: Config {
+                email: default_email(),
+                media: None,
+                listen: "127.0.0.1:0".into(),
+                data_dir: dir.path().to_owned(),
+                vault_html: dir.path().join("unused"),
+                node_id: random(18),
+                bridge: random(18),
+                reserve_bytes: FLOOR,
+            },
+            db: Mutex::new(c),
+            rates: Mutex::new(HashMap::new()),
+            auth_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            io_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            request_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+            public_slots: Arc::new(tokio::sync::Semaphore::new(24)),
+            chat_stream_slots: Arc::new(tokio::sync::Semaphore::new(256)),
+            chat_events: tokio::sync::broadcast::channel(256).0,
+            traffic: Mutex::new(traffic::Traffic::default()),
+            gc: Mutex::new(GcCursor::default()),
+        });
+        let mut owner = HeaderMap::new();
+        owner.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {owner_token}").parse().unwrap(),
+        );
+        let mut reader = HeaderMap::new();
+        reader.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {reader_token}").parse().unwrap(),
+        );
+        (dir, app, owner, reader, key, owner_id, reader_id)
+    }
+    fn run(app: &App, h: &HeaderMap, value: Value) -> Api<Value> {
+        dispatch(
+            app,
+            h,
+            "127.0.0.1:4242".parse().unwrap(),
+            "127.0.0.1",
+            value,
+        )
+    }
+    fn envelope(id: &str, owner: &str, reader: Option<&str>, key: &SigningKey) -> Value {
+        let mut boxes = serde_json::Map::new();
+        boxes.insert(owner.into(), json!(B64.encode([1u8; 64])));
+        if let Some(reader) = reader {
+            boxes.insert(reader.into(), json!(B64.encode([2u8; 64])));
+        }
+        let data =
+            json!({"version":1,"id":id,"cipher":B64.encode([3u8;64]),"boxes":boxes}).to_string();
+        let signature: Signature = key.sign(data.as_bytes());
+        json!({"data":data,"signature":B64.encode(signature.to_bytes())})
+    }
+    #[test]
+    fn encrypted_catalog_is_owner_only_signed_versioned_and_recipient_scoped() {
+        let (_dir, app, owner, reader, key, owner_id, reader_id) = fixture();
+        let id = random(24);
+        let body = envelope(&id, &owner_id, None, &key);
+        let request = json!({"action":"emoji.publish","id":id,"version":"","body":body});
+        assert_eq!(
+            run(&app, &reader, request.clone()).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        let published = run(&app, &owner, request.clone()).unwrap();
+        let listing = run(&app, &reader, json!({"action":"emoji.list"})).unwrap();
+        assert_eq!(listing["items"][0]["ready"], false);
+        assert!(listing["items"][0]["recipients"].is_null());
+        assert_eq!(
+            run(&app, &reader, json!({"action":"emoji.get","id":id}))
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            run(&app, &owner, request).unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+        let next = envelope(&id, &owner_id, Some(&reader_id), &key);
+        run(
+            &app,
+            &owner,
+            json!({"action":"emoji.publish","id":id,"version":published["version"],"body":next}),
+        )
+        .unwrap();
+        let entry = run(&app, &reader, json!({"action":"emoji.get","id":id})).unwrap();
+        assert_eq!(entry["body"], next);
+        assert_eq!(
+            run(&app, &reader, json!({"action":"emoji.delete","id":id}))
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        run(&app, &owner, json!({"action":"emoji.delete","id":id})).unwrap();
+        assert!(
+            run(&app, &owner, json!({"action":"emoji.list"})).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn altered_or_wrong_publisher_catalog_signatures_are_rejected() {
+        let (_dir, app, owner, _reader, key, owner_id, _reader_id) = fixture();
+        let id = random(24);
+        let mut body = envelope(&id, &owner_id, None, &key);
+        let mut data: Value = serde_json::from_str(body["data"].as_str().unwrap()).unwrap();
+        data["cipher"] = json!(B64.encode([9u8; 64]));
+        body["data"] = json!(data.to_string());
+        assert_eq!(
+            run(
+                &app,
+                &owner,
+                json!({"action":"emoji.publish","id":id,"body":body})
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let wrong = SigningKey::random(&mut OsRng);
+        assert!(run(
+            &app,
+            &owner,
+            json!({"action":"emoji.publish","id":id,"body":envelope(&id,&owner_id,None,&wrong)})
+        )
+        .is_err());
+        assert!(
+            run(&app, &owner, json!({"action":"emoji.list"})).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn policy_and_selected_creators_change_atomically_and_preserve_other_permissions() {
+        let (_dir, app, owner, reader, _key, _owner_id, reader_id) = fixture();
+        {
+            let c = db(&app).unwrap();
+            c.execute(
+                "UPDATE chat_users SET can_invite=1,quota=123456 WHERE id=?",
+                [&reader_id],
+            )
+            .unwrap();
+        }
+        let initial = json!({"action":"policy","title":"Node","signupUntil":0,"createSpaces":"selected","spaceCreators":[reader_id]});
+        assert_eq!(
+            run(&app, &reader, initial.clone()).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        run(&app, &owner, initial).unwrap();
+        let invalid = json!({"action":"policy","title":"Invalid change","signupUntil":0,"createSpaces":"selected","spaceCreators":[random(24)]});
+        assert!(run(&app, &owner, invalid).is_err());
+        let c = db(&app).unwrap();
+        assert_eq!(setting(&c, "policy").unwrap()["title"], "Node");
+        let values: (bool, bool, i64) = c
+            .query_row(
+                "SELECT can_space,can_invite,quota FROM chat_users WHERE id=?",
+                [&reader_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(values, (true, true, 123456));
+    }
+    #[test]
+    fn gif_proxy_allowlist_blocks_other_hosts_ports_credentials_and_non_gif_commons_files() {
+        for url in [
+            "https://media.giphy.com/media/id/giphy.gif",
+            "https://media2.giphy.com/media/id/giphy.gif",
+            "https://upload.wikimedia.org/wikipedia/commons/a/ab/Cat.gif?utm_source=commons",
+        ] {
+            assert!(allowed_gif_url(url), "{url}");
+        }
+        for url in [
+            "http://media.giphy.com/a.gif",
+            "https://media.giphy.com.evil.test/a.gif",
+            "https://127.0.0.1/a.gif",
+            "https://media.giphy.com:8443/a.gif",
+            "https://user:password@media.giphy.com/a.gif",
+            "https://upload.wikimedia.org/wikipedia/en/a.gif",
+            "https://upload.wikimedia.org/wikipedia/commons/a.svg",
+            "https://evil.test/a.gif",
+            "https://media.giphy.com/a.gif#fragment",
+        ] {
+            assert!(!allowed_gif_url(url), "{url}");
+        }
+        assert_eq!(
+            plain_metadata("<a href='https://example.test'>Creator &amp; artist</a>"),
+            "Creator & artist"
+        );
+    }
+    #[tokio::test]
+    async fn attachment_ciphertext_stays_restricted_to_conversation_members() {
+        let (_dir, app, owner, reader, _key, owner_id, _reader_id) = fixture();
+        let room = random(24);
+        let object = random(24);
+        let bytes = vec![7u8; 64];
+        {
+            let c = db(&app).unwrap();
+            c.execute("INSERT INTO chat_rooms(id,space,kind,creator,sealed,created) VALUES(?,'','dm',?,'cipher',?)",params![room,owner_id,now()]).unwrap();
+            c.execute(
+                "INSERT INTO chat_members(room,user,box) VALUES(?,?,'cipher')",
+                params![room, owner_id],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO chat_objects VALUES(?,?,?,?,?, ?,1)",
+                params![object, room, owner_id, 64, 64, now()],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO chat_parts VALUES(?,0,?,64)",
+                params![object, hash(&bytes)],
+            )
+            .unwrap();
+        }
+        let folder = app.cfg.data_dir.join("chat").join(&object);
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("0"), &bytes).unwrap();
+        assert!(
+            get_object(State(app.clone()), owner, RoutePath((object.clone(), 0)))
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            get_object(State(app.clone()), reader, RoutePath((object, 0)))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    #[tokio::test]
+    async fn media_tokens_require_membership_an_active_owned_device_and_no_timeout() {
+        let (_dir, mut app, owner, reader, _key, owner_id, reader_id) = fixture();
+        Arc::get_mut(&mut app).unwrap().cfg.media = Some(Media {
+            url: "wss://node.test/chat/relay".into(),
+            http: "http://127.0.0.1:7880".into(),
+            key: "test-key".into(),
+            secret: "test-secret".into(),
+        });
+        let room = random(24);
+        let device = random(24);
+        {
+            let c = db(&app).unwrap();
+            c.execute("INSERT INTO chat_rooms(id,space,kind,creator,sealed,created) VALUES(?,'','group',?,'cipher',?)",params![room,owner_id,now()]).unwrap();
+            c.execute(
+                "INSERT INTO chat_members(room,user,box) VALUES(?,?,'cipher')",
+                params![room, reader_id],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO chat_devices VALUES(?,?,'certificate','package',?,0)",
+                params![device, reader_id, now()],
+            )
+            .unwrap();
+        }
+        let value = json!({"room":room,"device":device});
+        let token = media_token(State(app.clone()), reader.clone(), Json(value.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(token["url"], "wss://node.test/chat/relay");
+        let claims: Value = serde_json::from_slice(
+            &B64.decode(token["token"].as_str().unwrap().split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["sub"], format!("{reader_id}:{device}"));
+        assert_eq!(claims["video"]["room"], room);
+        assert_eq!(claims["video"]["canPublishData"], false);
+        assert_eq!(
+            media_token(State(app.clone()), owner, Json(value.clone()))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        {
+            let c = db(&app).unwrap();
+            c.execute(
+                "UPDATE chat_members SET timeout=? WHERE room=? AND user=?",
+                params![now() + 60, room, reader_id],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            media_token(State(app.clone()), reader.clone(), Json(value.clone()))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        {
+            let c = db(&app).unwrap();
+            c.execute("UPDATE chat_members SET timeout=0", []).unwrap();
+            c.execute("UPDATE chat_devices SET revoked=1", []).unwrap();
+        }
+        assert_eq!(
+            media_token(State(app.clone()), reader, Json(value))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    #[tokio::test]
+    #[ignore = "Calls the public Wikimedia Commons service; run explicitly for provider smoke testing"]
+    async fn commons_live_search_returns_allowlisted_gifs_without_a_key() {
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent("VortexNode/1.0 (self-hosted encrypted chat)")
+            .timeout(Duration::from_secs(15));
+        // Optional trust anchor for a test runner behind a TLS-inspecting proxy.
+        // This test-only setting never changes the production provider client.
+        if let Ok(path) = std::env::var("VORTEX_TEST_CA") {
+            builder = builder.add_root_certificate(
+                reqwest::Certificate::from_pem(&fs::read(path).unwrap()).unwrap(),
+            );
+        }
+        let client = builder.build().unwrap();
+        let result = commons_gifs(&client, "cat").await.unwrap().0;
+        let items = result["items"].as_array().unwrap();
+        assert!(!items.is_empty());
+        for item in items {
+            assert!(allowed_gif_url(item["url"].as_str().unwrap()));
+            assert!(item["attribution"].as_str().unwrap().contains('·'));
         }
     }
 }
