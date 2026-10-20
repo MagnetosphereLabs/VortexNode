@@ -24,7 +24,10 @@ function config(value) {
     };
   });
 }
+const activity = new Map();
 self.addEventListener("message", (e) => {
+  if (e.data?.type === "activity" && e.source?.id)
+    activity.set(e.source.id, { active: !!e.data.active, at: Date.now() });
   if (e.data?.type === "configure") e.waitUntil(config(e.data.value));
   if (e.data?.type === "clear") e.waitUntil(config({}));
 });
@@ -44,20 +47,41 @@ self.addEventListener("push", (e) =>
       if (!r.ok) return;
       const { notices } = await r.json();
       if (!notices?.length) return;
-      const n = notices.at(-1);
-      await config({ ...c, cursor: n.id });
+      await config({ ...c, cursor: notices.at(-1).id });
+      const n = notices.filter((notice) => notice.pushAllowed !== false).at(-1);
+      if (!n) return;
+      const open = await clients.matchAll({
+        type: "window",
+        includeUncontrolled: true,
+      });
+      const foreground = open.some((client) => {
+        const state = activity.get(client.id);
+        return (
+          new URL(client.url).pathname.startsWith("/chat/") &&
+          (state && Date.now() - state.at < 45000
+            ? state.active
+            : client.focused && client.visibilityState === "visible")
+        );
+      });
+      if (foreground) return;
       const title =
         n.kind === "call"
           ? "Incoming call"
           : n.kind === "login"
             ? "New login on your account"
-            : "New message";
+            : n.kind === "friend.request"
+              ? "Friend request"
+              : n.kind === "friend.accept"
+                ? "Friend request accepted"
+                : n.kind === "space.invite"
+                  ? "Space invitation"
+                  : "New message";
       await self.registration.showNotification(title, {
         body: "Vortex Chat",
         icon: "/chat/icon.svg",
         badge: "/chat/icon.svg",
         tag: n.kind === "call" ? "vortex-call" : "vortex-activity",
-        data: { room: n.room },
+        data: { room: n.room, kind: n.kind },
         renotify: true,
       });
     })(),
@@ -78,6 +102,7 @@ self.addEventListener("notificationclick", (e) => {
         existing.postMessage({
           type: "open-room",
           room: e.notification.data?.room,
+          kind: e.notification.data?.kind,
         });
         await existing.focus();
       } else await clients.openWindow("/chat/");
