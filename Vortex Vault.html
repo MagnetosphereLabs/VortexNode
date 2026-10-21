@@ -1913,7 +1913,7 @@
           </div>
           <div class="brandText">
             <div class="h">Vortex</div>
-            <div class="s" id="subtitle">Portable encrypted workspace</div>
+            <div class="s" id="subtitle">End-to-end encrypted</div>
           </div>
         </div>
 
@@ -3918,7 +3918,7 @@ const MAX_PENDING_BYTES = Math.floor(3 * 1024 * 1024 * 1024);
     const on = state.unlocked;
     ui.statusDot.className = "dot" + (on ? " ok" : "");
     ui.statusLabel.textContent = on ? "Vault Loaded" : "Not Loaded";
-    ui.subtitle.textContent = on ? "Encrypted workspace unlocked" : "Portable encrypted workspace";
+    ui.subtitle.textContent = on ? "End-to-end encrypted · unlocked" : "End-to-end encrypted";
 
     ui.btnSave.disabled = !on;
     if (ui.btnSaveLogout) ui.btnSaveLogout.disabled = !on;
@@ -14429,8 +14429,8 @@ window.VortexSession=(()=>{
 </script>
 <style id="vortexRefinementStyles">
 /* Precise compact controls and complete, readable connection states. */
-/* Seven workspaces, including Chat, share one compact icon row. */
-@media(max-width:760px){
+/* Switch all seven workspace buttons before their labels become cramped. */
+@media(max-width:850px){
  #workspaceBar .workspaceTabs{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));width:100%;min-width:0;gap:3px}
  #workspaceBar .workspaceTab{min-width:0;width:100%;padding:0;gap:0;flex:none;box-sizing:border-box}
  #workspaceBar .workspaceTab>span:not(.workspaceTabIcon){display:none}
