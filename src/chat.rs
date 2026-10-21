@@ -179,6 +179,24 @@ fn former_users(c: &Connection) -> Api<Value> {
     let rows = q.query_map([], |r| Ok(json!({"id":r.get::<_,String>(0)?,"identity":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap_or(Value::Null),"devices":serde_json::from_str::<Value>(&r.get::<_,String>(2)?).unwrap_or(json!([])),"username":"deleted","display":"Deleted account","status":"offline","deleted":true})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     Ok(json!(rows))
 }
+fn are_friends(c: &Connection, a: &str, b: &str) -> Api<bool> {
+    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM chat_friends f JOIN chat_friends other ON other.user=f.other AND other.other=f.user JOIN chat_users person ON person.id=f.other WHERE f.user=? AND f.other=? AND f.status='friend' AND other.status='friend' AND person.disabled=0)", params![a,b], |r| r.get(0))?)
+}
+fn friend_ids(c: &Connection, user: &str) -> Api<Value> {
+    let mut q = c.prepare("SELECT f.other FROM chat_friends f JOIN chat_friends other ON other.user=f.other AND other.other=f.user JOIN chat_users person ON person.id=f.other WHERE f.user=? AND f.status='friend' AND other.status='friend' AND person.disabled=0 ORDER BY f.other")?;
+    let ids = q.query_map([user], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    Ok(json!(ids))
+}
+fn require_dm_friend(c: &Connection, user: &str, room: &str) -> Api<()> {
+    let direct: bool = c.query_row("SELECT kind='dm' AND space='' FROM chat_rooms WHERE id=?", [room], |r| r.get(0))?;
+    if direct {
+        let other: Option<String> = c.query_row("SELECT user FROM chat_members WHERE room=? AND user!=? AND banned=0 LIMIT 1", params![room,user], |r| r.get(0)).optional()?;
+        if !other.as_deref().map(|other| are_friends(c,user,other)).transpose()?.unwrap_or(false) {
+            return Err(Fault(StatusCode::FORBIDDEN, "Become friends before sending direct messages or starting a call"));
+        }
+    }
+    Ok(())
+}
 fn active_now(c: &Connection, user: &str) -> Api<bool> {
     Ok(c.query_row(
         "SELECT EXISTS(SELECT 1 FROM chat_activity WHERE user=? AND at>? AND idle=0 AND viewing=1)",
@@ -738,7 +756,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
             Ok(
-                json!({"id":u.id,"owner":u.owner,"canInvite":u.owner || c.query_row("SELECT can_invite FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"canSpace":u.owner || c.query_row("SELECT can_space FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"username":name,"bundle":bundle,"identity":serde_json::from_str::<Value>(&identity).unwrap_or(Value::Null),"totp":!totp.is_empty(),"policy":setting(&c,"policy")?,"users":directory(&c)?,"formerUsers":former_users(&c)?,"media":a.cfg.media.is_some(),"months":c.query_row("SELECT months FROM chat_login_policy WHERE user=?",[&u.id],|r|r.get::<_,i64>(0)).optional()?.unwrap_or(12),"preferences":c.query_row("SELECT body FROM chat_preferences WHERE user=?",[&u.id],|r|r.get::<_,String>(0)).optional()?.unwrap_or_default()}),
+                json!({"id":u.id,"owner":u.owner,"canInvite":u.owner || c.query_row("SELECT can_invite FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"canSpace":u.owner || c.query_row("SELECT can_space FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"username":name,"bundle":bundle,"identity":serde_json::from_str::<Value>(&identity).unwrap_or(Value::Null),"totp":!totp.is_empty(),"policy":setting(&c,"policy")?,"users":directory(&c)?,"formerUsers":former_users(&c)?,"friendIds":friend_ids(&c,&u.id)?,"media":a.cfg.media.is_some(),"months":c.query_row("SELECT months FROM chat_login_policy WHERE user=?",[&u.id],|r|r.get::<_,i64>(0)).optional()?.unwrap_or(12),"preferences":c.query_row("SELECT body FROM chat_preferences WHERE user=?",[&u.id],|r|r.get::<_,String>(0)).optional()?.unwrap_or_default()}),
             )
         }
         "logout" => {
@@ -906,7 +924,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 notify(&tx, &other, "friend.accept", &u.id)?;
             }
             tx.commit()?;
-            Ok(json!({"ok":true}))
+            Ok(json!({"ok":true,"friendIds":friend_ids(&c,&u.id)?}))
         }
         "friends" => {
             // Accepted friendships have reciprocal rows. Return one visible
@@ -1337,7 +1355,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 c.execute("INSERT INTO chat_activity(user,session,instance,at,idle,viewing) VALUES(?,?,?,?,?,?) ON CONFLICT(user,session,instance) DO UPDATE SET at=excluded.at,idle=excluded.idle,viewing=excluded.viewing",params![u.id,u.session,instance,now(),v["idle"].as_bool().unwrap_or(false) as i32,v["viewing"].as_bool().unwrap_or(true) as i32])?;
             }
             c.execute("DELETE FROM chat_activity WHERE at<?", [now() - 300])?;
-            Ok(json!({"ok":true,"users":directory(&c)?,"formerUsers":former_users(&c)?}))
+            Ok(json!({"ok":true,"users":directory(&c)?,"formerUsers":former_users(&c)?,"friendIds":friend_ids(&c,&u.id)?}))
         }
         "space.create" => {
             let policy = setting(&c, "policy")?;
@@ -1423,6 +1441,17 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             let users = v["members"].as_array().ok_or(bad("Choose participants"))?;
             if users.len() > 256 || !users.iter().any(|x| x["user"] == u.id) {
                 return Err(bad("Invalid participants"));
+            }
+            if kind == "dm" {
+                if !space.is_empty() || users.len()!=2 || users[0]["user"]==users[1]["user"] {
+                    return Err(bad("Direct messages require exactly two people"));
+                }
+                for person in users {
+                    let other = text(person,"user");
+                    if other!=u.id && !are_friends(&c,&u.id,&other)? {
+                        return Err(Fault(StatusCode::FORBIDDEN,"Become friends before starting a direct message"));
+                    }
+                }
             }
             if !space.is_empty() {
                 let administrator: String = c.query_row(
@@ -1573,7 +1602,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 [&room],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            if space.is_empty() && kind_room=="dm" && c.query_row("SELECT EXISTS(SELECT 1 FROM chat_friends f JOIN chat_members m ON (m.user=f.user OR m.user=f.other) WHERE m.room=? AND f.status='blocked' AND (f.user=? OR f.other=?))",params![room,u.id,u.id],|r|r.get::<_,bool>(0))? {return Err(denied())}
+            if space.is_empty() && kind_room=="dm" && c.query_row("SELECT EXISTS(SELECT 1 FROM chat_members m JOIN chat_friends f ON ((f.user=?2 AND f.other=m.user) OR (f.other=?2 AND f.user=m.user)) WHERE m.room=?1 AND m.user!=?2 AND f.status='blocked')",params![room,u.id],|r|r.get::<_,bool>(0))? {return Err(denied())}
             let device = text(&v, "device");
             if c.query_row(
                 "SELECT 1 FROM chat_devices WHERE id=? AND user=? AND revoked=0",
@@ -1586,6 +1615,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 return Err(denied());
             }
             let kind = text(&v, "kind");
+            if kind=="message" || kind=="call" { require_dm_friend(&c,&u.id,&room)?; }
             if ![
                 "message", "mls", "welcome", "call", "typing", "receipt", "emoji",
             ]
@@ -1848,6 +1878,7 @@ pub async fn media_token(
     {
         let c = db(&a)?;
         member(&c, &u, &room)?;
+        require_dm_friend(&c,&u.id,&room)?;
         if c.query_row(
             "SELECT timeout FROM chat_members WHERE room=? AND user=?",
             params![room, u.id],
@@ -1890,6 +1921,7 @@ pub async fn begin_object(
     let mut c = db(&a)?;
     let tx = c.transaction()?;
     member(&tx, &u, &room)?;
+    require_dm_friend(&tx,&u.id,&room)?;
     let (quota,used):(i64,i64)=tx.query_row("SELECT quota,(SELECT COALESCE(SUM(bytes),0) FROM chat_objects WHERE sender=chat_users.id)+(SELECT COALESCE(SUM(length(body)),0) FROM chat_events WHERE sender=chat_users.id) FROM chat_users WHERE id=?",[&u.id],|r|Ok((r.get(0)?,r.get(1)?)))?;
     if used.saturating_add(bytes) > quota {
         return Err(Fault(
@@ -2543,6 +2575,43 @@ mod polish_tests {
         let signature: Signature = key.sign(data.as_bytes());
         json!({"data":data,"signature":B64.encode(signature.to_bytes())})
     }
+    #[test]
+    fn direct_messages_require_an_accepted_friendship_and_history_survives_unfriending() {
+        let (_dir, app, owner, reader, _key, owner_id, reader_id) = fixture();
+        let room=random(24);let box_value=B64.encode([7u8;64]);
+        let create=json!({"action":"room.create","id":room,"kind":"dm","space":"","sealed":box_value,"members":[{"user":owner_id,"box":box_value},{"user":reader_id,"box":box_value}]});
+        assert_eq!(run(&app,&owner,create.clone()).unwrap_err().0,StatusCode::FORBIDDEN);
+        run(&app,&owner,json!({"action":"friend","user":reader_id,"kind":"request"})).unwrap();
+        assert_eq!(run(&app,&owner,create.clone()).unwrap_err().0,StatusCode::FORBIDDEN);
+        let accepted=run(&app,&reader,json!({"action":"friend","user":owner_id,"kind":"accept"})).unwrap();
+        assert_eq!(accepted["friendIds"],json!([owner_id]));
+        run(&app,&owner,create).unwrap();
+        assert!(require_dm_friend(&db(&app).unwrap(),&owner_id,&room).is_ok());
+        let fresh=run(&app,&owner,json!({"action":"presence","idle":false})).unwrap();assert_eq!(fresh["friendIds"],json!([reader_id]));
+        run(&app,&owner,json!({"action":"friend","user":reader_id,"kind":"remove"})).unwrap();
+        assert_eq!(require_dm_friend(&db(&app).unwrap(),&owner_id,&room).unwrap_err().0,StatusCode::FORBIDDEN);
+        let device=random(24);db(&app).unwrap().execute("INSERT INTO chat_devices VALUES(?,?,'certificate','package',?,0)",params![device,owner_id,now()]).unwrap();
+        let send=json!({"action":"event","room":room,"kind":"message","device":device,"id":random(24),"body":{}});
+        let error=run(&app,&owner,send).unwrap_err();assert!(error.1.contains("Become friends"));
+        assert!(run(&app,&owner,json!({"action":"events","room":room})).is_ok());
+        assert!(run(&app,&owner,json!({"action":"rooms"})).unwrap()["rooms"].as_array().unwrap().iter().any(|r|r["id"]==room));
+        db(&app).unwrap().execute("UPDATE chat_rooms SET kind='group' WHERE id=?",[&room]).unwrap();
+        assert!(require_dm_friend(&db(&app).unwrap(),&owner_id,&room).is_ok());
+    }
+
+    #[tokio::test]
+    async fn nonfriends_cannot_join_dm_calls_or_upload_dm_attachments() {
+        let (_dir, app, owner, _reader, _key, owner_id, reader_id) = fixture();
+        let room=random(24);let device=random(24);
+        {
+            let c=db(&app).unwrap();c.execute("INSERT INTO chat_rooms(id,space,kind,creator,sealed,created) VALUES(?,'','dm',?,'cipher',?)",params![room,owner_id,now()]).unwrap();
+            for id in [&owner_id,&reader_id]{c.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,'cipher')",params![room,id]).unwrap();}
+            c.execute("INSERT INTO chat_devices VALUES(?,?,'certificate','package',?,0)",params![device,owner_id,now()]).unwrap();
+        }
+        let media=media_token(State(app.clone()),owner.clone(),Json(json!({"room":room,"device":device}))).await.unwrap_err();assert_eq!(media.0,StatusCode::FORBIDDEN);assert!(media.1.contains("Become friends"));
+        let upload=begin_object(State(app.clone()),owner,Json(json!({"room":room,"bytes":64}))).await.unwrap_err();assert_eq!(upload.0,StatusCode::FORBIDDEN);assert!(upload.1.contains("Become friends"));
+    }
+
     #[test]
     fn reciprocal_friendships_are_returned_once_and_other_peoples_blocks_are_private() {
         let (_dir, app, owner, reader, _key, owner_id, reader_id) = fixture();
