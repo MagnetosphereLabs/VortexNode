@@ -116,6 +116,25 @@ fn room_permission(c: &Connection, u: &User, room: &str, bit: i64) -> Api<()> {
         Err(denied())
     }
 }
+const MAX_CHAT_UPLOAD: i64 = 100 * 1024 * 1024 * 1024;
+// Keep settings exactly representable by the JavaScript administration UI (~8 PiB).
+const MAX_CHAT_QUOTA: i64 = 9_007_199_254_740_991;
+fn chat_limits(c: &Connection) -> Api<(i64, i64)> {
+    let policy = setting(c, "policy")?;
+    Ok((policy["maxUpload"].as_i64().unwrap_or(MAX_CHAT_UPLOAD).clamp(1, MAX_CHAT_UPLOAD),
+        policy["chatQuota"].as_i64().unwrap_or(0).max(0)))
+}
+fn chat_storage_used(c: &Connection) -> Api<i64> {
+    // Count complete files and in-flight reservations, so concurrent uploads cannot overbook.
+    Ok(c.query_row("SELECT (SELECT COALESCE(SUM(bytes),0) FROM chat_objects)+(SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM chat_events)+(SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM chat_node_emoji)", [], |r|r.get(0))?)
+}
+fn reserve_chat(c: &Connection, additional: i64) -> Api<()> {
+    let (_, quota) = chat_limits(c)?;
+    if quota > 0 && chat_storage_used(c)?.saturating_add(additional) > quota {
+        return Err(Fault(StatusCode::INSUFFICIENT_STORAGE, "The Node's Chat storage allowance is full"));
+    }
+    Ok(())
+}
 fn owner(u: &User) -> Api<()> {
     if u.owner {
         Ok(())
@@ -375,6 +394,7 @@ pub async fn action(
         "presence",
         "emoji.list",
         "emoji.get",
+        "admin.storage",
     ]
     .contains(&name.as_str());
     let room = text(&v, "room");
@@ -385,6 +405,15 @@ pub async fn action(
     } else {
         None
     };
+    let access_removed = if name == "room.access" {
+        let c = db(&a)?;
+        let actor = user(&a, &h)?;
+        room_permission(&c, &actor, &room, 1)?;
+        let selected = v["members"].as_array().ok_or(bad("Invalid channel participants"))?;
+        let mut query = c.prepare("SELECT user FROM chat_members WHERE room=? AND banned=0")?;
+        let rows = query.query_map([&room], |r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        rows.into_iter().filter(|id| !selected.iter().any(|entry| text(entry,"user")==*id)).collect::<Vec<_>>()
+    } else { Vec::new() };
     let deleted_user = if name == "admin.user.delete" { Some(text(&v, "user")) } else { None };
     let deleted_rooms = if let Some(target) = &deleted_user {
         owner(&user(&a, &h)?)?;
@@ -403,11 +432,12 @@ pub async fn action(
     if let Some(target) = kick {
         kick_media(&a, &room, &target).await;
     }
+    if !access_removed.is_empty() { kick_media_users(&a, &room, &access_removed).await; }
     if let Some(target) = deleted_user {
         for room in deleted_rooms { kick_media(&a, &room, &target).await; }
     }
     if changed {
-        let _ = a.chat_events.send(room);
+        let _ = a.chat_events.send(if name == "room.access" { String::new() } else { room });
     }
     Ok(Json(out))
 }
@@ -741,7 +771,11 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             if used + body.len() as i64 > 64 * 1024 * 1024 {
                 return Err(bad("The Node emoji catalog is full"));
             }
-            c.execute("INSERT INTO chat_node_emoji VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET creator=excluded.creator,body=excluded.body,audience=excluded.audience", params![id,u.id,body,json!(audience).to_string()])?;
+            let tx = c.transaction()?;
+            let growth = (body.len() as i64 - old.as_ref().map(|value|value.len() as i64).unwrap_or(0)).max(0);
+            if growth > 0 { reserve_chat(&tx, growth)?; reserve(&tx, a, growth as u64)?; }
+            tx.execute("INSERT INTO chat_node_emoji VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET creator=excluded.creator,body=excluded.body,audience=excluded.audience", params![id,u.id,body,json!(audience).to_string()])?;
+            tx.commit()?;
             Ok(json!({"ok":true,"version":hash(&body)}))
         }
         "emoji.delete" => {
@@ -964,6 +998,35 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             }
             Ok(json!({"ok":true}))
         }
+        "room.access" => {
+            let room = text(&v, "room");
+            room_permission(&c, &u, &room, 1)?;
+            let (space, creator): (String, String) = c.query_row("SELECT space,creator FROM chat_rooms WHERE id=?", [&room], |r|Ok((r.get(0)?,r.get(1)?)))?;
+            if space.is_empty() { return Err(denied()); }
+            let boxes = v["members"].as_array().filter(|items| !items.is_empty() && items.len() <= 4096).ok_or(bad("Invalid channel participants"))?;
+            let sealed = ciphertext(&v, "sealed", 65536)?;
+            let tx = c.transaction()?;
+            let mut ids = std::collections::HashSet::new();
+            for entry in boxes {
+                let id = text(entry, "user");
+                if !ids.insert(id.clone()) || !tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_space_members m JOIN chat_users u ON u.id=m.user WHERE m.space=? AND m.user=? AND m.banned=0 AND u.disabled=0)", params![space,id], |r|r.get::<_,bool>(0))? { return Err(bad("Choose active members of this Space")); }
+                ciphertext(entry, "box", 32768)?;
+            }
+            if !ids.contains(&creator) || !ids.contains(&u.id) { return Err(bad("Keep the channel creator and yourself in the channel")); }
+            let owners = {
+                let mut query = tx.prepare("SELECT m.user FROM chat_members m JOIN chat_users u ON u.id=m.user WHERE m.room=? AND u.node_owner IS NOT NULL AND m.banned=0")?;
+                let rows = query.query_map([&room], |r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+                rows
+            };
+            if owners.iter().any(|id| !ids.contains(id)) { return Err(denied()); }
+            tx.execute("UPDATE chat_members SET banned=1 WHERE room=?", [&room])?;
+            for entry in boxes {
+                tx.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,?) ON CONFLICT(room,user) DO UPDATE SET box=excluded.box,banned=0,timeout=0", params![room,text(entry,"user"),ciphertext(entry,"box",32768)?])?;
+            }
+            tx.execute("UPDATE chat_rooms SET sealed=?,needs_rekey=1 WHERE id=?", params![sealed,room])?;
+            tx.commit()?;
+            Ok(json!({"ok":true}))
+        }
         "room.metadata" => {
             let room = text(&v, "room");
             manager(&c, &u, &room)?;
@@ -989,7 +1052,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
         "room.rekey" => {
             let room = text(&v, "room");
             let deleted_member: bool = c.query_row("SELECT needs_rekey=2 FROM chat_rooms WHERE id=?", [&room], |r| r.get(0))?;
-            if deleted_member { member(&c, &u, &room)?; } else { room_permission(&c, &u, &room, 2)?; }
+            if deleted_member { member(&c, &u, &room)?; } else if room_permission(&c, &u, &room, 2).is_err() { room_permission(&c, &u, &room, 1)?; }
             let boxes = v["members"].as_array().ok_or(bad("Invalid participants"))?;
             let sealed = ciphertext(&v, "sealed", 65536)?;
             let tx = c.transaction()?;
@@ -1066,8 +1129,22 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             set(&c, "gif-key", &json!(key))?;
             Ok(json!({"ok":true}))
         }
+        "admin.storage" => {
+            owner(&u)?;
+            let (max_upload, quota) = chat_limits(&c)?;
+            Ok(json!({"maxUpload":max_upload,"quota":quota,"used":chat_storage_used(&c)?}))
+        }
         "policy" => {
             owner(&u)?;
+            let (old_upload, old_quota) = chat_limits(&c)?;
+            let max_upload = match v.get("maxUpload") {
+                Some(value) => value.as_i64().filter(|n| (1..=MAX_CHAT_UPLOAD).contains(n)).ok_or(bad("Maximum upload must be between 1 byte and 100 GiB"))?,
+                None => old_upload,
+            };
+            let chat_quota = match v.get("chatQuota") {
+                Some(value) => value.as_i64().filter(|n| (0..=MAX_CHAT_QUOTA).contains(n)).ok_or(bad("Invalid Chat storage allowance"))?,
+                None => old_quota,
+            };
             let until = v["signupUntil"].as_i64().unwrap_or(0);
             let create = text(&v, "createSpaces");
             if !["owner", "selected", "everyone"].contains(&create.as_str())
@@ -1103,7 +1180,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             set(
                 &tx,
                 "policy",
-                &json!({"signupUntil":until,"createSpaces":create,"title":title,"ready":true}),
+                &json!({"signupUntil":until,"createSpaces":create,"title":title,"ready":true,"maxUpload":max_upload,"chatQuota":chat_quota}),
             )?;
             tx.commit()?;
             Ok(json!({"ok":true}))
@@ -1558,6 +1635,8 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
         }
         "room.moderate" => {
             let room = text(&v, "room");
+            let space: String = c.query_row("SELECT space FROM chat_rooms WHERE id=?", [&room], |r|r.get(0))?;
+            if space.is_empty() { return Err(denied()); }
             room_permission(&c, &u, &room, 2)?;
             let target = text(&v, "user");
             let creator: String =
@@ -1693,6 +1772,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                     }
                 }
             }
+            reserve_chat(&tx, body.len() as i64)?;
             reserve(&tx, a, body.len() as u64)?;
             if free_bytes(&a.cfg.data_dir)? < safety_floor(a) + CONTROL_HEADROOM {
                 return Err(Fault(
@@ -1941,6 +2021,12 @@ pub async fn begin_object(
             ));
         }
     }
+    let (max_upload, _) = chat_limits(&tx)?;
+    let encrypted_limit = max_upload + ((max_upload + BLOCK as i64 - 1) / BLOCK as i64) * 28;
+    if bytes > encrypted_limit {
+        return Err(bad("This file exceeds the Node's maximum upload size"));
+    }
+    reserve_chat(&tx, bytes)?;
     reserve(&tx, &a, bytes as u64)?;
     let id = random(24);
     tx.execute(
@@ -2434,6 +2520,10 @@ pub async fn stream(State(a): State<App>, h: HeaderMap) -> Api<Response> {
         .into_response())
 }
 async fn kick_media(a: &App, room: &str, target: &str) {
+    kick_media_users(a, room, &[target.to_owned()]).await;
+}
+async fn kick_media_users(a: &App, room: &str, targets: &[String]) {
+    use futures_util::StreamExt;
     let Some(cfg) = &a.cfg.media else { return };
     let token = jwt(
         &cfg.key,
@@ -2460,20 +2550,16 @@ async fn kick_media(a: &App, room: &str, target: &str) {
         return;
     };
     if let Some(list) = value["participants"].as_array() {
-        for p in list {
-            let id = text(p, "identity");
-            if id.starts_with(&format!("{target}:")) {
-                let _ = client
-                    .post(format!(
-                        "{}/twirp/livekit.RoomService/RemoveParticipant",
-                        cfg.http
-                    ))
-                    .bearer_auth(&token)
-                    .json(&json!({"room":room,"identity":id}))
-                    .send()
-                    .await;
-            }
+        let targets = targets.iter().map(String::as_str).collect::<std::collections::HashSet<_>>();
+        let mut requests = Vec::new();
+        for participant in list {
+            let identity = text(participant, "identity");
+            if !targets.contains(identity.split(':').next().unwrap_or_default()) { continue; }
+            let request = client.post(format!("{}/twirp/livekit.RoomService/RemoveParticipant", cfg.http))
+                .bearer_auth(&token).json(&json!({"room":room,"identity":identity}));
+            requests.push(async move { let _ = request.send().await; });
         }
+        futures_util::stream::iter(requests).buffer_unordered(8).collect::<Vec<_>>().await;
     }
 }
 
@@ -2770,6 +2856,78 @@ mod polish_tests {
                 .is_empty()
         );
     }
+    #[test]
+    fn chat_storage_policy_is_owner_only_validated_and_backward_compatible() {
+        let (_dir, app, owner, reader, _key, _owner_id, _reader_id) = fixture();
+        assert_eq!(run(&app, &reader, json!({"action":"admin.storage"})).unwrap_err().0, StatusCode::FORBIDDEN);
+        let policy = json!({"action":"policy","title":"Node","signupUntil":0,"createSpaces":"owner","maxUpload":MAX_CHAT_UPLOAD,"chatQuota":5*1024i64.pow(4)});
+        run(&app, &owner, policy.clone()).unwrap();
+        let limits = run(&app, &owner, json!({"action":"admin.storage"})).unwrap();
+        assert_eq!(limits["quota"], 5*1024i64.pow(4));
+        assert_eq!(limits["maxUpload"], MAX_CHAT_UPLOAD);
+        let mut invalid = policy.clone(); invalid["maxUpload"] = json!(MAX_CHAT_UPLOAD+1);
+        assert!(run(&app, &owner, invalid).is_err());
+        let mut invalid = policy.clone(); invalid["chatQuota"] = json!(-1);
+        assert!(run(&app, &owner, invalid).is_err());
+        run(&app, &owner, json!({"action":"policy","title":"Renamed","signupUntil":0,"createSpaces":"owner"})).unwrap();
+        assert_eq!(chat_limits(&db(&app).unwrap()).unwrap(), (MAX_CHAT_UPLOAD,5*1024i64.pow(4)));
+    }
+
+    #[test]
+    fn chat_storage_counts_pending_reservations_messages_and_catalog() {
+        let (_dir, app, owner, _reader, _key, owner_id, _reader_id) = fixture();
+        run(&app, &owner, json!({"action":"policy","title":"Node","signupUntil":0,"createSpaces":"owner","chatQuota":100})).unwrap();
+        let c = db(&app).unwrap();
+        c.execute("INSERT INTO chat_objects VALUES('pending','room',?,60,0,?,0)",params![owner_id,now()]).unwrap();
+        c.execute("INSERT INTO chat_events(room,sender,device,id,kind,body,at) VALUES('room',?,'device','event','message','1234567890',?)",params![owner_id,now()]).unwrap();
+        c.execute("INSERT INTO chat_node_emoji VALUES('emoji',?,'1234567890','[]')",[owner_id]).unwrap();
+        assert_eq!(chat_storage_used(&c).unwrap(),80);
+        assert!(reserve_chat(&c,20).is_ok());
+        assert_eq!(reserve_chat(&c,21).unwrap_err().0,StatusCode::INSUFFICIENT_STORAGE);
+        drop(c);
+        run(&app, &owner, json!({"action":"policy","title":"Node","signupUntil":0,"createSpaces":"owner","chatQuota":0})).unwrap();
+        assert!(reserve_chat(&db(&app).unwrap(),MAX_CHAT_UPLOAD).is_ok());
+    }
+
+    #[tokio::test]
+    async fn file_size_and_node_limits_are_enforced_before_upload_reservation() {
+        let (_dir, app, owner, _reader, _key, owner_id, _reader_id) = fixture();
+        let room=random(24);
+        {let c=db(&app).unwrap();c.execute("INSERT INTO chat_rooms(id,space,kind,creator,sealed,created) VALUES(?,'','group',?,'cipher',?)",params![room,owner_id,now()]).unwrap();c.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,'cipher')",params![room,owner_id]).unwrap();}
+        run(&app,&owner,json!({"action":"policy","title":"Node","signupUntil":0,"createSpaces":"owner","maxUpload":1024,"chatQuota":100})).unwrap();
+        let error=begin_object(State(app.clone()),owner.clone(),Json(json!({"room":room,"bytes":1053}))).await.unwrap_err();assert!(error.1.contains("maximum upload"));
+        let error=begin_object(State(app.clone()),owner,Json(json!({"room":room,"bytes":101}))).await.unwrap_err();assert_eq!(error.0,StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(db(&app).unwrap().query_row("SELECT COUNT(*) FROM chat_objects",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[test]
+    fn private_chats_reject_moderation_and_channel_access_changes() {
+        let (_dir, app, owner, _reader, _key, owner_id, reader_id) = fixture();
+        for kind in ["dm","group"] {
+            let room=random(24);let c=db(&app).unwrap();c.execute("INSERT INTO chat_rooms(id,space,kind,creator,sealed,created) VALUES(?,'',?,?,'cipher',?)",params![room,kind,owner_id,now()]).unwrap();
+            for user in [&owner_id,&reader_id]{c.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,'cipher')",params![room,user]).unwrap();}drop(c);
+            assert_eq!(run(&app,&owner,json!({"action":"room.moderate","room":room,"user":reader_id,"banned":true})).unwrap_err().0,StatusCode::FORBIDDEN);
+            assert_eq!(run(&app,&owner,json!({"action":"room.access","room":room})).unwrap_err().0,StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[test]
+    fn channel_access_updates_atomically_and_preserves_required_members() {
+        let (_dir, app, owner, reader, _key, owner_id, reader_id) = fixture();
+        let room=random(24);let space=random(24);let stranger=random(24);let encrypted=B64.encode([7u8;64]);
+        {let c=db(&app).unwrap();c.execute("INSERT INTO chat_spaces(id,creator,sealed,created) VALUES(?,?,'cipher',?)",params![space,owner_id,now()]).unwrap();c.execute("INSERT INTO chat_rooms(id,space,kind,creator,sealed,created) VALUES(?,?,'text',?,'cipher',?)",params![room,space,owner_id,now()]).unwrap();for id in [&owner_id,&reader_id]{c.execute("INSERT INTO chat_space_members(space,user) VALUES(?,?)",params![space,id]).unwrap();c.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,'cipher')",params![room,id]).unwrap();}}
+        let request=json!({"action":"room.access","room":room,"sealed":encrypted,"members":[{"user":owner_id,"box":encrypted}]});
+        assert_eq!(run(&app,&reader,request.clone()).unwrap_err().0,StatusCode::FORBIDDEN);
+        let mut invalid=request.clone();invalid["members"]=json!([{"user":owner_id,"box":encrypted},{"user":stranger,"box":encrypted}]);assert!(run(&app,&owner,invalid).is_err());
+        let reader_user=user(&app,&reader).unwrap();let owner_user=user(&app,&owner).unwrap();assert!(member(&db(&app).unwrap(),&reader_user,&room).is_ok());
+        db(&app).unwrap().execute("UPDATE chat_space_members SET permissions=1 WHERE space=? AND user=?",params![space,reader_id]).unwrap();
+        let keep_both=json!({"action":"room.access","room":room,"sealed":encrypted,"members":[{"user":owner_id,"box":encrypted},{"user":reader_id,"box":encrypted}]});
+        run(&app,&reader,keep_both.clone()).unwrap();
+        let mut rekey=keep_both;rekey["action"]=json!("room.rekey");run(&app,&reader,rekey).unwrap();
+        run(&app,&owner,request).unwrap();assert!(member(&db(&app).unwrap(),&reader_user,&room).is_err());
+        let c=db(&app).unwrap();assert!(member(&c,&owner_user,&room).is_ok());assert_eq!(c.query_row("SELECT needs_rekey FROM chat_rooms WHERE id=?",[room],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
     #[test]
     fn policy_and_selected_creators_change_atomically_and_preserve_other_permissions() {
         let (_dir, app, owner, reader, _key, _owner_id, reader_id) = fixture();
