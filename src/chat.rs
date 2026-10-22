@@ -403,15 +403,15 @@ pub async fn action(
         None
     };
     let access_removed = if name == "room.access" {
-        let c = db(&a)?;
         let actor = user(&a, &h)?;
+        let c = db(&a)?;
         room_permission(&c, &actor, &room, 1)?;
         let selected = v["members"].as_array().ok_or(bad("Invalid channel participants"))?;
         let mut query = c.prepare("SELECT user FROM chat_members WHERE room=? AND banned=0")?;
         let rows = query.query_map([&room], |r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
         rows.into_iter().filter(|id| !selected.iter().any(|entry| text(entry,"user")==*id)).collect::<Vec<_>>()
     } else { Vec::new() };
-    let deleted_user = if name == "admin.user.delete" { Some(text(&v, "user")) } else { None };
+    let deleted_user = if name == "admin.user.delete" || (name == "admin.user" && v["disabled"] == true) { Some(text(&v, "user")) } else { None };
     let deleted_rooms = if let Some(target) = &deleted_user {
         owner(&user(&a, &h)?)?;
         let c = db(&a)?;
@@ -419,6 +419,15 @@ pub async fn action(
         let rows = q.query_map([target], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
         rows
     } else { Vec::new() };
+    let space_ban = if name == "space.member" && v["banned"] == true {
+        let actor = user(&a, &h)?;
+        let c = db(&a)?;
+        let space = text(&v, "space");
+        if !permission(&c, &actor, &space, 128)? { return Err(denied()); }
+        let mut q = c.prepare("SELECT id FROM chat_rooms WHERE space=?")?;
+        let rooms = q.query_map([space], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        Some((text(&v, "user"), rooms))
+    } else { None };
     let work = a.clone();
     let out = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -432,6 +441,9 @@ pub async fn action(
     if !access_removed.is_empty() { kick_media_users(&a, &room, &access_removed).await; }
     if let Some(target) = deleted_user {
         for room in deleted_rooms { kick_media(&a, &room, &target).await; }
+    }
+    if let Some((target, rooms)) = space_ban {
+        for room in rooms { kick_media(&a, &room, &target).await; }
     }
     if changed {
         let _ = a.chat_events.send(if name == "room.access" { String::new() } else { room });
@@ -1205,7 +1217,8 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             if node_owner.is_some() {
                 return Err(denied());
             }
-            c.execute(
+            let tx = c.transaction()?;
+            tx.execute(
                 "UPDATE chat_users SET can_invite=?,can_space=?,disabled=?,quota=? WHERE id=?",
                 params![
                     v["invite"].as_bool().unwrap_or(false) as i32,
@@ -1219,8 +1232,11 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 ],
             )?;
             if v["disabled"] == true {
-                c.execute("DELETE FROM chat_sessions WHERE user=?", [&id])?;
+                tx.execute("DELETE FROM chat_sessions WHERE user=?", [&id])?;
+                tx.execute("UPDATE chat_rooms SET needs_rekey=2 WHERE id IN (SELECT room FROM chat_members WHERE user=?)", [&id])?;
+                tx.execute("UPDATE chat_members SET banned=1 WHERE user=?", [&id])?;
             }
+            tx.commit()?;
             Ok(json!({"ok":true}))
         }
         "admin.user.delete" => {
@@ -1484,7 +1500,13 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             if role.len() > 80 || color.len() > 16 {
                 return Err(bad("Invalid role"));
             }
-            c.execute("INSERT INTO chat_space_members VALUES(?,?,?,?,?,?) ON CONFLICT(space,user) DO UPDATE SET permissions=excluded.permissions,role=excluded.role,color=excluded.color,banned=excluded.banned",params![space,target,perms,role,color,v["banned"].as_bool().unwrap_or(false) as i32])?;
+            let tx = c.transaction()?;
+            tx.execute("INSERT INTO chat_space_members VALUES(?,?,?,?,?,?) ON CONFLICT(space,user) DO UPDATE SET permissions=excluded.permissions,role=excluded.role,color=excluded.color,banned=excluded.banned",params![space,target,perms,role,color,v["banned"].as_bool().unwrap_or(false) as i32])?;
+            if v["banned"] == true {
+                tx.execute("UPDATE chat_rooms SET needs_rekey=2 WHERE space=? AND id IN (SELECT room FROM chat_members WHERE user=? AND banned=0)", params![space,target])?;
+                tx.execute("UPDATE chat_members SET banned=1 WHERE user=? AND room IN (SELECT id FROM chat_rooms WHERE space=?)", params![target,space])?;
+            }
+            tx.commit()?;
             Ok(json!({"ok":true}))
         }
         "room.create" => {
@@ -2754,6 +2776,28 @@ mod polish_tests {
         let result = run(&app, &reader, json!({"action":"totp.finish","otp":code})).unwrap();
         assert_eq!(result["recovery"].as_array().unwrap().len(), 10);
         assert_eq!(db(&app).unwrap().query_row("SELECT totp FROM chat_users WHERE id=?", [&reader_id], |r| r.get::<_, String>(0)).unwrap(), seed);
+    }
+
+    #[test]
+    fn disabling_an_account_revokes_sessions_and_requires_fresh_room_keys() {
+        let (_dir, app, owner, reader, _key, owner_id, reader_id) = fixture();
+        let room = random(24);
+        {
+            let c = db(&app).unwrap();
+            c.execute("INSERT INTO chat_rooms(id,space,kind,creator,sealed,created) VALUES(?,'','group',?,'cipher',?)", params![room,owner_id,now()]).unwrap();
+            for id in [&owner_id,&reader_id] {
+                c.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,'cipher')", params![room,id]).unwrap();
+            }
+        }
+        run(&app, &owner, json!({"action":"admin.user","user":reader_id,"disabled":true})).unwrap();
+        assert!(user(&app, &reader).is_err());
+        let c = db(&app).unwrap();
+        assert_eq!(c.query_row("SELECT needs_rekey FROM chat_rooms WHERE id=?", [&room], |r| r.get::<_,i64>(0)).unwrap(), 2);
+        assert_eq!(c.query_row("SELECT banned FROM chat_members WHERE room=? AND user=?", params![room,reader_id], |r| r.get::<_,i64>(0)).unwrap(), 1);
+        assert_eq!(c.query_row("SELECT banned FROM chat_members WHERE room=? AND user=?", params![room,owner_id], |r| r.get::<_,i64>(0)).unwrap(), 0);
+        drop(c);
+        run(&app, &owner, json!({"action":"admin.user","user":reader_id,"disabled":false})).unwrap();
+        assert!(user(&app, &reader).is_err(), "Re-enabling an account must not revive old tokens");
     }
 
     #[test]
