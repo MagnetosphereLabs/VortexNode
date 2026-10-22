@@ -56,7 +56,11 @@ pub async fn index(State(a): State<App>) -> Api<Response> {
     let Some(root) = &a.cfg.chat_web_dir else { return Ok(chat::html().await) };
     let mut html = tokio::fs::read_to_string(root.join("index.html")).await?;
     let nonce = random(18);
-    html = html.replace("<script", &format!("<script nonce=\"{nonce}\""));
+    html = html.replace("{{CSP_NONCE_PLACEHOLDER}}", &nonce)
+        .replace("{{STATIC_CDN_ENDPOINT}}", "/vortex/assets")
+        .replace("{{MEDIA_ENDPOINT}}", "/vortex/media")
+        .replace("<title>Fluxer</title>", "<title>Vortex Chat</title>");
+    html = html.replace("<script src=", &format!("<script nonce=\"{nonce}\" src="));
     let policy = format!("default-src 'none'; script-src 'self' 'nonce-{nonce}' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self' data:; media-src 'self' blob: mediastream:; connect-src 'self' wss:; worker-src 'self' blob:; manifest-src 'self'; frame-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     Ok(([(header::CONTENT_TYPE,"text/html; charset=utf-8"),(header::CONTENT_SECURITY_POLICY,policy.as_str())],html).into_response())
 }
@@ -79,7 +83,7 @@ pub async fn file(State(a): State<App>, request: axum::extract::Request) -> Api<
         "js"|"mjs"=>"text/javascript", "css"=>"text/css", "json"|"map"=>"application/json",
         "wasm"=>"application/wasm", "svg"=>"image/svg+xml", "png"=>"image/png", "webp"=>"image/webp",
         "gif"=>"image/gif", "jpg"|"jpeg"=>"image/jpeg", "ico"=>"image/x-icon",
-        "woff2"=>"font/woff2", "woff"=>"font/woff", "ttf"=>"font/ttf", "webmanifest"=>"application/manifest+json",
+        "avif"=>"image/avif", "mp4"=>"video/mp4", "webm"=>"video/webm", "gz"=>"application/gzip", "onnx"=>"application/octet-stream", "woff2"=>"font/woff2", "woff"=>"font/woff", "ttf"=>"font/ttf", "webmanifest"=>"application/manifest+json",
         "ogg"=>"audio/ogg", "mp3"=>"audio/mpeg", "txt"=>"text/plain; charset=utf-8",
         _=>return Err(Fault(StatusCode::NOT_FOUND,"Not found")),
     };
