@@ -151,9 +151,10 @@ chmod -R a+rX "$WORK/source"
 if [[ ! -x /var/cache/vortex-node-build/cargo/bin/cargo ]]; then
   curl --proto '=https' --tlsv1.2 -fsSL --retry 3 https://sh.rustup.rs -o "$WORK/rustup.sh"
   chmod 644 "$WORK/rustup.sh"
-  runuser -u vortex-build -- env CARGO_HOME=/var/cache/vortex-node-build/cargo RUSTUP_HOME=/var/cache/vortex-node-build/rustup sh "$WORK/rustup.sh" -y --no-modify-path --profile minimal --default-toolchain stable
+  runuser -u vortex-build -- env CARGO_HOME=/var/cache/vortex-node-build/cargo RUSTUP_HOME=/var/cache/vortex-node-build/rustup sh "$WORK/rustup.sh" -y --no-modify-path --profile minimal --default-toolchain 1.99.1
 fi
-runuser -u vortex-build -- env PATH=/var/cache/vortex-node-build/cargo/bin:/usr/sbin:/usr/bin:/sbin:/bin CARGO_HOME=/var/cache/vortex-node-build/cargo RUSTUP_HOME=/var/cache/vortex-node-build/rustup CARGO_TARGET_DIR=/var/cache/vortex-node-build/target /var/cache/vortex-node-build/cargo/bin/cargo build --manifest-path "$SOURCE/Cargo.toml" --release --locked
+runuser -u vortex-build -- env CARGO_HOME=/var/cache/vortex-node-build/cargo RUSTUP_HOME=/var/cache/vortex-node-build/rustup /var/cache/vortex-node-build/cargo/bin/rustup toolchain install 1.99.1 --profile minimal
+runuser -u vortex-build -- env PATH=/var/cache/vortex-node-build/cargo/bin:/usr/sbin:/usr/bin:/sbin:/bin CARGO_HOME=/var/cache/vortex-node-build/cargo RUSTUP_HOME=/var/cache/vortex-node-build/rustup CARGO_TARGET_DIR=/var/cache/vortex-node-build/target /var/cache/vortex-node-build/cargo/bin/cargo +1.99.1 build --manifest-path "$SOURCE/Cargo.toml" --release --locked
 RELEASE="$ROOT/releases/$COMMIT"
 install -d -m 755 "$RELEASE"
 install -m 755 /var/cache/vortex-node-build/target/release/vortex-node "$RELEASE/vortex-node.new"
