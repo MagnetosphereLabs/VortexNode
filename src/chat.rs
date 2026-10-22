@@ -999,17 +999,31 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             room_permission(&c, &u, &room, 2)?;
             let target = text(&v, "user");
             let box_value = ciphertext(&v, "box", 32768)?;
-            c.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,?) ON CONFLICT(room,user) DO UPDATE SET box=excluded.box,banned=0",params![room,target,box_value])?;
-            let space: String =
-                c.query_row("SELECT space FROM chat_rooms WHERE id=?", [&room], |r| {
-                    r.get(0)
-                })?;
-            if !space.is_empty() {
-                c.execute(
-                    "INSERT OR IGNORE INTO chat_space_members(space,user) VALUES(?,?)",
-                    params![space, target],
-                )?;
+            let tx = c.transaction()?;
+            let (space, kind): (String, String) = tx.query_row(
+                "SELECT space,kind FROM chat_rooms WHERE id=?", [&room], |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if !tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_users WHERE id=? AND disabled=0)", [&target], |r| r.get::<_, bool>(0))? {
+                return Err(bad("Unknown account"));
             }
+            let existing: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_members WHERE room=? AND user=? AND banned=0)", params![room,target], |r|r.get(0))?;
+            // A DM cannot silently become a group conversation. Create a new
+            // group with an explicit participant list instead.
+            if kind == "dm" && !existing { return Err(denied()); }
+            if space.is_empty() {
+                let blocked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_friends f JOIN chat_members m ON m.room=? AND m.banned=0 WHERE f.status='blocked' AND ((f.user=m.user AND f.other=?) OR (f.user=? AND f.other=m.user)))", params![room,target,target], |r|r.get(0))?;
+                if blocked { return Err(denied()); }
+            } else if tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_space_members WHERE space=? AND user=? AND banned=1)", params![space,target], |r|r.get::<_,bool>(0))? {
+                return Err(denied());
+            }
+            if !existing && tx.query_row("SELECT COUNT(*) FROM chat_members WHERE room=? AND banned=0", [&room], |r|r.get::<_,i64>(0))? >= 256 {
+                return Err(bad("Conversation participant limit reached"));
+            }
+            tx.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,?) ON CONFLICT(room,user) DO UPDATE SET box=excluded.box,banned=0", params![room,target,box_value])?;
+            if !space.is_empty() {
+                tx.execute("INSERT OR IGNORE INTO chat_space_members(space,user) VALUES(?,?)", params![space,target])?;
+            }
+            tx.commit()?;
             Ok(json!({"ok":true}))
         }
         "room.access" => {
@@ -2732,6 +2746,41 @@ mod polish_tests {
         assert!(run(&app,&owner,json!({"action":"rooms"})).unwrap()["rooms"].as_array().unwrap().iter().any(|r|r["id"]==room));
         db(&app).unwrap().execute("UPDATE chat_rooms SET kind='group' WHERE id=?",[&room]).unwrap();
         assert!(require_dm_friend(&db(&app).unwrap(),&owner_id,&room).is_ok());
+    }
+
+    #[test]
+    fn adding_participants_preserves_dm_boundaries_blocks_and_account_status() {
+        let (_dir, app, owner, reader, _key, owner_id, reader_id) = fixture();
+        let room=random(24); let encrypted=B64.encode([7u8;64]);
+        {
+            let c=db(&app).unwrap();
+            c.execute("INSERT INTO chat_rooms(id,space,kind,creator,sealed,created) VALUES(?,'','dm',?,'cipher',?)",params![room,owner_id,now()]).unwrap();
+            c.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,'cipher')",params![room,owner_id]).unwrap();
+        }
+        let add=json!({"action":"room.member","room":room,"user":reader_id,"box":encrypted});
+        assert_eq!(run(&app,&owner,add.clone()).unwrap_err().0,StatusCode::FORBIDDEN);
+        db(&app).unwrap().execute("UPDATE chat_rooms SET kind='group' WHERE id=?",[&room]).unwrap();
+        assert!(run(&app,&reader,add.clone()).is_err());
+        run(&app,&reader,json!({"action":"friend","user":owner_id,"kind":"block"})).unwrap();
+        assert_eq!(run(&app,&owner,add.clone()).unwrap_err().0,StatusCode::FORBIDDEN);
+        {
+            let c=db(&app).unwrap();c.execute("DELETE FROM chat_friends",[]).unwrap();
+            c.execute("UPDATE chat_users SET disabled=1 WHERE id=?",[&reader_id]).unwrap();
+        }
+        assert!(run(&app,&owner,add.clone()).is_err());
+        db(&app).unwrap().execute("UPDATE chat_users SET disabled=0 WHERE id=?",[&reader_id]).unwrap();
+        run(&app,&owner,add.clone()).unwrap();
+        let space=random(24);
+        {
+            let c=db(&app).unwrap();
+            c.execute("INSERT INTO chat_spaces(id,creator,sealed,created) VALUES(?,?,'cipher',?)",params![space,owner_id,now()]).unwrap();
+            c.execute("INSERT INTO chat_space_members(space,user,permissions) VALUES(?,?,255)",params![space,owner_id]).unwrap();
+            c.execute("INSERT INTO chat_space_members(space,user,banned) VALUES(?,?,1)",params![space,reader_id]).unwrap();
+            c.execute("UPDATE chat_rooms SET space=?,kind='text' WHERE id=?",params![space,room]).unwrap();
+            c.execute("UPDATE chat_members SET banned=1 WHERE room=? AND user=?",params![room,reader_id]).unwrap();
+        }
+        assert_eq!(run(&app,&owner,add).unwrap_err().0,StatusCode::FORBIDDEN);
+        assert_eq!(db(&app).unwrap().query_row("SELECT banned FROM chat_members WHERE room=? AND user=?",params![room,reader_id],|r|r.get::<_,bool>(0)).unwrap(),true);
     }
 
     #[tokio::test]
