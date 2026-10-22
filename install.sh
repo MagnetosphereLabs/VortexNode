@@ -200,6 +200,8 @@ import json,os,sys
 path,repo,domain,email,listen,node,bridge,applications=sys.argv[1:]
 previous=json.load(open(path)) if os.path.exists(path) else {}
 c=dict(repository=repo,domain=domain,email=email,listen=listen,node_id=node,bridge=bridge,data_dir='/var/lib/vortex-node',vault_html='/opt/vortex-node/current/vault.html',reserve_bytes=previous.get('reserve_bytes',10_000_000_000),vault_enabled=applications=='both')
+c['public_url']='https://'+domain
+if 'chat_web_dir' in previous:c['chat_web_dir']=previous['chat_web_dir']
 for key in ('media','media_ports'):
  if key in previous:c[key]=previous[key]
 tmp=path+'.new'

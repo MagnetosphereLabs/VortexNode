@@ -3,6 +3,7 @@ mod store;
 mod export;
 mod chat;
 mod traffic;
+mod client;
 use anyhow::{Context, Result};
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::{
@@ -52,6 +53,10 @@ struct Config {
     /// Disabled applications are not mounted in the HTTP router.
     #[serde(default = "default_enabled")]
     vault_enabled: bool,
+    #[serde(default)]
+    public_url: Option<String>,
+    #[serde(default)]
+    chat_web_dir: Option<PathBuf>,
     #[serde(default = "default_email")]
     email: String,
     #[serde(default)]
@@ -1645,7 +1650,9 @@ async fn vault_html(State(a): State<App>) -> Api<Response> {
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
 async fn application_home(State(a): State<App>) -> Api<Response> {
-    if a.cfg.vault_enabled {
+    if a.cfg.chat_web_dir.is_some() {
+        client::index(State(a)).await
+    } else if a.cfg.vault_enabled {
         vault_html(State(a)).await
     } else {
         Ok(chat::html().await)
@@ -1731,9 +1738,11 @@ fn router(a: App) -> Router {
         .merge(public_routes)
         .route("/connect", get(info))
         .route("/health", get(health))
+        .route("/.well-known/vortex", get(client::protocol))
+        .route("/.well-known/fluxer", get(client::discovery))
         .route("/", get(application_home))
-        .route("/chat", get(chat::html))
-        .route("/chat/", get(chat::html))
+        .route("/chat", get(client::index))
+        .route("/chat/", get(client::index))
         .route("/chat/action", post(chat::action).layer(DefaultBodyLimit::max(2*1024*1024)))
         .route("/chat/stream", get(chat::stream))
         .route("/chat/auth.js", get(chat::auth_script))
@@ -1747,6 +1756,7 @@ fn router(a: App) -> Router {
         .route("/chat/manifest.webmanifest", get(chat::manifest))
         .route("/chat/icon.svg", get(chat::icon))
         .nest(&gate, routes)
+        .fallback(client::file)
         .layer(axum::middleware::from_fn_with_state(a.clone(),traffic::guard))
         .layer(DefaultBodyLimit::max(2 * MAX_MANIFEST + 65536))
         .layer(

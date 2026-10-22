@@ -80,9 +80,6 @@ pub fn authenticated(a: &App, h: &HeaderMap) -> Api<bool> {
     Ok(user(a, h).is_ok())
 }
 fn permission(c: &Connection, u: &User, space: &str, bit: i64) -> Api<bool> {
-    if u.owner {
-        return Ok(true);
-    }
     Ok(c.query_row("SELECT (m.permissions & ?) != 0 OR s.creator=? FROM chat_space_members m JOIN chat_spaces s ON s.id=m.space WHERE m.space=? AND m.user=? AND m.banned=0",params![bit,u.id,space,u.id],|r|r.get(0)).optional()?.unwrap_or(false))
 }
 fn member(c: &Connection, u: &User, room: &str) -> Api<()> {
@@ -109,7 +106,7 @@ fn room_permission(c: &Connection, u: &User, room: &str, bit: i64) -> Api<()> {
         [room],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    if creator == u.id || u.owner && bit == 8 || !space.is_empty() && permission(c, u, &space, bit)?
+    if creator == u.id || !space.is_empty() && permission(c, u, &space, bit)?
     {
         Ok(())
     } else {
@@ -1013,12 +1010,6 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 ciphertext(entry, "box", 32768)?;
             }
             if !ids.contains(&creator) || !ids.contains(&u.id) { return Err(bad("Keep the channel creator and yourself in the channel")); }
-            let owners = {
-                let mut query = tx.prepare("SELECT m.user FROM chat_members m JOIN chat_users u ON u.id=m.user WHERE m.room=? AND u.node_owner IS NOT NULL AND m.banned=0")?;
-                let rows = query.query_map([&room], |r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
-                rows
-            };
-            if owners.iter().any(|id| !ids.contains(id)) { return Err(denied()); }
             tx.execute("UPDATE chat_members SET banned=1 WHERE room=?", [&room])?;
             for entry in boxes {
                 tx.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,?) ON CONFLICT(room,user) DO UPDATE SET box=excluded.box,banned=0,timeout=0", params![room,text(entry,"user"),ciphertext(entry,"box",32768)?])?;
@@ -1458,7 +1449,6 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 "INSERT INTO chat_space_members(space,user,permissions) VALUES(?,?,255)",
                 params![id, u.id],
             )?;
-            tx.execute("INSERT OR IGNORE INTO chat_space_members(space,user,permissions) SELECT ?,id,255 FROM chat_users WHERE node_owner IS NOT NULL",[&id])?;
             tx.commit()?;
             Ok(json!({"id":id}))
         }
@@ -1474,15 +1464,10 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 [&space],
                 |r| r.get(0),
             )?;
-            let is_owner: bool = c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM chat_users WHERE id=? AND node_owner IS NOT NULL)",
-                [&target],
-                |r| r.get(0),
-            )?;
-            if target == creator || is_owner || target == u.id {
+            if target == creator || target == u.id {
                 return Err(denied());
             }
-            let mine: i64 = if u.owner || creator == u.id {
+            let mine: i64 = if creator == u.id {
                 255
             } else {
                 c.query_row(
@@ -1528,16 +1513,6 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                     if other!=u.id && !are_friends(&c,&u.id,&other)? {
                         return Err(Fault(StatusCode::FORBIDDEN,"Become friends before starting a direct message"));
                     }
-                }
-            }
-            if !space.is_empty() {
-                let administrator: String = c.query_row(
-                    "SELECT id FROM chat_users WHERE node_owner IS NOT NULL LIMIT 1",
-                    [],
-                    |r| r.get(0),
-                )?;
-                if !users.iter().any(|m| m["user"] == administrator) {
-                    return Err(bad("Space channels must include their Node owner"));
                 }
             }
             let sealed = ciphertext(&v, "sealed", 65536)?;
@@ -1643,12 +1618,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 c.query_row("SELECT creator FROM chat_rooms WHERE id=?", [&room], |r| {
                     r.get(0)
                 })?;
-            let is_owner: bool = c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM chat_users WHERE id=? AND node_owner IS NOT NULL)",
-                [&target],
-                |r| r.get(0),
-            )?;
-            if target == creator || is_owner || target == u.id {
+            if target == creator || target == u.id {
                 return Err(denied());
             }
             c.execute(
@@ -1982,7 +1952,15 @@ pub async fn media_token(
         StatusCode::SERVICE_UNAVAILABLE,
         "Calling is unavailable",
     ))?;
-    let claims = json!({"iss":cfg.key,"sub":format!("{}:{}",u.id,device),"nbf":now()-5,"exp":now()+120,"video":{"roomJoin":true,"room":room,"canPublish":true,"canSubscribe":true,"canPublishData":false}});
+    let identity = if v["client"] == "fluxer" {
+        let connection = text(&v,"connection");
+        if connection.len() < 16 || connection.len() > 80 || !connection.bytes().all(|b|b.is_ascii_alphanumeric() || b==b'-' || b==b'_') {
+            return Err(bad("Invalid call connection"));
+        }
+        let id = fluxer_user_id(&u.id);
+        format!("user_{id}_{connection}")
+    } else { format!("{}:{}",u.id,device) };
+    let claims = json!({"iss":cfg.key,"sub":identity,"nbf":now()-5,"exp":now()+120,"video":{"roomJoin":true,"room":room,"canPublish":true,"canSubscribe":true,"canPublishData":false}});
     Ok(Json(
         json!({"url":cfg.url,"token":jwt(&cfg.key,&cfg.secret,claims)}),
     ))
@@ -2519,6 +2497,14 @@ pub async fn stream(State(a): State<App>, h: HeaderMap) -> Api<Response> {
         .keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(10)))
         .into_response())
 }
+fn fluxer_user_id(user: &str) -> u64 {
+    let digest = Sha256::digest(format!("vortex-fluxer-v1:user:{user}").as_bytes());
+    u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 has eight bytes")) & 0x7fffffffffffffff
+}
+fn media_identity_belongs_to(identity: &str, user: &str) -> bool {
+    identity.strip_prefix(user).is_some_and(|suffix| suffix.starts_with(':'))
+        || identity.starts_with(&format!("user_{}_", fluxer_user_id(user)))
+}
 async fn kick_media(a: &App, room: &str, target: &str) {
     kick_media_users(a, room, &[target.to_owned()]).await;
 }
@@ -2550,11 +2536,10 @@ async fn kick_media_users(a: &App, room: &str, targets: &[String]) {
         return;
     };
     if let Some(list) = value["participants"].as_array() {
-        let targets = targets.iter().map(String::as_str).collect::<std::collections::HashSet<_>>();
         let mut requests = Vec::new();
         for participant in list {
             let identity = text(participant, "identity");
-            if !targets.contains(identity.split(':').next().unwrap_or_default()) { continue; }
+            if !targets.iter().any(|target| media_identity_belongs_to(&identity, target)) { continue; }
             let request = client.post(format!("{}/twirp/livekit.RoomService/RemoveParticipant", cfg.http))
                 .bearer_auth(&token).json(&json!({"room":room,"identity":identity}));
             requests.push(async move { let _ = request.send().await; });
@@ -2610,6 +2595,8 @@ mod polish_tests {
         let app = Arc::new(Inner {
             cfg: Config {
                 vault_enabled: true,
+                public_url: Some("http://127.0.0.1:4242".into()),
+                chat_web_dir: None,
                 email: default_email(),
                 media: None,
                 listen: "127.0.0.1:0".into(),
@@ -3047,6 +3034,15 @@ mod polish_tests {
                 .0,
             StatusCode::FORBIDDEN
         );
+    }
+    #[test]
+    fn media_identity_revocation_covers_both_clients_without_prefix_collisions() {
+        assert!(media_identity_belongs_to("alice:device", "alice"));
+        assert!(!media_identity_belongs_to("alice-other:device", "alice"));
+        let identity = format!("user_{}_connection", fluxer_user_id("alice"));
+        assert!(media_identity_belongs_to(&identity, "alice"));
+        assert!(!media_identity_belongs_to(&identity, "bob"));
+        assert!(!media_identity_belongs_to(&identity.replacen("_connection", "0_connection", 1), "alice"));
     }
     #[tokio::test]
     async fn media_tokens_require_membership_an_active_owned_device_and_no_timeout() {
