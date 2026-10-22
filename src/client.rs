@@ -52,6 +52,25 @@ pub async fn discovery(State(a): State<App>) -> Api<Json<Value>> {
     })))
 }
 
+fn connection_sources(public_url: Option<&str>, media_url: Option<&str>) -> Api<String> {
+    let mut origins = std::collections::BTreeSet::new();
+    for address in [public_url, media_url].into_iter().flatten() {
+        let mut url = reqwest::Url::parse(address).map_err(|_| bad("Invalid client connection origin"))?;
+        let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+        if !matches!(url.scheme(), "https" | "wss") && !(local && matches!(url.scheme(), "http" | "ws"))
+            || !url.username().is_empty() || url.password().is_some()
+            || url.host_str().is_none_or(|host| host.contains('*')) {
+            return Err(bad("Client connections require an explicit secure origin"));
+        }
+        let secure = matches!(url.scheme(), "https" | "wss");
+        url.set_scheme(if secure { "https" } else { "http" }).map_err(|_| bad("Invalid connection scheme"))?;
+        origins.insert(url.origin().ascii_serialization());
+        url.set_scheme(if secure { "wss" } else { "ws" }).map_err(|_| bad("Invalid connection scheme"))?;
+        origins.insert(url.origin().ascii_serialization());
+    }
+    Ok(std::iter::once("'self'".to_owned()).chain(origins).collect::<Vec<_>>().join(" "))
+}
+
 pub async fn index(State(a): State<App>) -> Api<Response> {
     let Some(root) = &a.cfg.chat_web_dir else { return Ok(chat::html().await) };
     let mut html = tokio::fs::read_to_string(root.join("index.html")).await?;
@@ -61,7 +80,8 @@ pub async fn index(State(a): State<App>) -> Api<Response> {
         .replace("{{MEDIA_ENDPOINT}}", "/vortex/media")
         .replace("<title>Fluxer</title>", "<title>Vortex Chat</title>");
     html = html.replace("<script src=", &format!("<script nonce=\"{nonce}\" src="));
-    let policy = format!("default-src 'none'; script-src 'self' 'nonce-{nonce}' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self' data:; media-src 'self' blob: mediastream:; connect-src 'self' wss:; worker-src 'self' blob:; manifest-src 'self'; frame-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+    let connections = connection_sources(a.cfg.public_url.as_deref(), a.cfg.media.as_ref().map(|media| media.url.as_str()))?;
+    let policy = format!("default-src 'none'; script-src 'self' 'nonce-{nonce}' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self' data:; media-src 'self' blob: mediastream:; connect-src {connections}; worker-src 'self' blob:; manifest-src 'self'; frame-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     Ok(([(header::CONTENT_TYPE,"text/html; charset=utf-8"),(header::CONTENT_SECURITY_POLICY,policy.as_str())],html).into_response())
 }
 
@@ -88,4 +108,20 @@ pub async fn file(State(a): State<App>, request: axum::extract::Request) -> Api<
         _=>return Err(Fault(StatusCode::NOT_FOUND,"Not found")),
     };
     Ok(([(header::CONTENT_TYPE,content_type)],tokio::fs::read(file).await?).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_policy_names_only_the_node_and_its_media_relay() {
+        assert_eq!(connection_sources(Some("https://chat.example"), Some("wss://relay.example:8443/rtc")).unwrap(),
+            "'self' https://chat.example https://relay.example:8443 wss://chat.example wss://relay.example:8443");
+        assert_eq!(connection_sources(Some("http://127.0.0.1:8080"), None).unwrap(),
+            "'self' http://127.0.0.1:8080 ws://127.0.0.1:8080");
+        for invalid in ["http://remote.example", "ws://remote.example", "wss://user:password@relay.example", "wss://*.example", "data:text/plain,invalid"] {
+            assert!(connection_sources(None, Some(invalid)).is_err(), "{invalid}");
+        }
+    }
 }
