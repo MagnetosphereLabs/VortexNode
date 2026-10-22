@@ -50,6 +50,11 @@ fn setting(c: &Connection, k: &str) -> Api<Value> {
         .unwrap_or(Value::Null),
     )
 }
+pub fn push_public_key(c: &Connection) -> Api<String> {
+    let bytes = B64.decode(setting(c, "vapid")?.as_str().unwrap_or("")).map_err(|_| bad("Push unavailable"))?;
+    let key = SigningKey::from_slice(&bytes).map_err(|_| bad("Push unavailable"))?;
+    Ok(B64.encode(key.verifying_key().to_encoded_point(false).as_bytes()))
+}
 fn set(c: &Connection, k: &str, v: &Value) -> Api<()> {
     c.execute(
         "INSERT INTO chat_settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1885,11 +1890,21 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             tx.commit()?;
             Ok(json!({"recovery":codes}))
         }
+        "push.list" => {
+            let mut q = c.prepare("SELECT endpoint FROM chat_push WHERE user=?")?;
+            let endpoints = q.query_map([&u.id], |r| r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            Ok(json!({"endpoints":endpoints}))
+        }
+        "push.remove" => {
+            c.execute("DELETE FROM chat_push WHERE user=? AND endpoint=?", params![u.id,text(&v,"endpoint")])?;
+            Ok(json!({"ok":true}))
+        }
         "push" => {
             let endpoint = text(&v, "endpoint");
             let parsed = reqwest::Url::parse(&endpoint).map_err(|_| bad("Invalid push service"))?;
             let host = parsed.host_str().unwrap_or("");
-            if parsed.scheme() != "https"
+            if parsed.scheme() != "https" || parsed.port().is_some_and(|port| port != 443)
+                || !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some()
                 || !(host == "fcm.googleapis.com"
                     || host.ends_with(".push.services.mozilla.com")
                     || host == "updates.push.services.mozilla.com"
@@ -1900,6 +1915,9 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             if endpoint.len() > 4096 {
                 return Err(bad("Invalid push subscription"));
             }
+            if decode(&v,"p256dh",65)?.len()!=65 || decode(&v,"auth",16)?.len()!=16 { return Err(bad("Invalid push keys")); }
+            let count: i64 = c.query_row("SELECT COUNT(*) FROM chat_push WHERE user=? AND endpoint!=?", params![u.id,endpoint], |r| r.get(0))?;
+            if count >= 32 { return Err(bad("Remove an old push subscription first")); }
             c.execute("INSERT INTO chat_push(user,endpoint,p256dh,auth,created,session) VALUES(?,?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET user=excluded.user,p256dh=excluded.p256dh,auth=excluded.auth,session=excluded.session",params![u.id,endpoint,text(&v,"p256dh"),text(&v,"auth"),now(),u.session])?;
             Ok(json!({"ok":true}))
         }
@@ -2776,6 +2794,24 @@ mod polish_tests {
         let result = run(&app, &reader, json!({"action":"totp.finish","otp":code})).unwrap();
         assert_eq!(result["recovery"].as_array().unwrap().len(), 10);
         assert_eq!(db(&app).unwrap().query_row("SELECT totp FROM chat_users WHERE id=?", [&reader_id], |r| r.get::<_, String>(0)).unwrap(), seed);
+    }
+
+    #[test]
+    fn push_subscriptions_are_account_scoped_and_reject_redirect_authority_tricks() {
+        let (_dir, app, owner, reader, _key, _owner_id, _reader_id) = fixture();
+        let endpoint = "https://web.push.apple.com/test-subscription";
+        let request = json!({"action":"push","endpoint":endpoint,"p256dh":B64.encode([4u8;65]),"auth":B64.encode([1u8;16])});
+        run(&app, &reader, request.clone()).unwrap();
+        assert_eq!(run(&app, &reader, json!({"action":"push.list"})).unwrap()["endpoints"], json!([endpoint]));
+        assert_eq!(run(&app, &owner, json!({"action":"push.list"})).unwrap()["endpoints"], json!([]));
+        run(&app, &owner, json!({"action":"push.remove","endpoint":endpoint})).unwrap();
+        assert_eq!(run(&app, &reader, json!({"action":"push.list"})).unwrap()["endpoints"], json!([endpoint]));
+        for invalid in ["https://web.push.apple.com:8443/test", "https://name@web.push.apple.com/test", "https://web.push.apple.com.evil.invalid/test"] {
+            let mut body = request.clone();body["endpoint"] = json!(invalid);
+            assert!(run(&app, &reader, body).is_err());
+        }
+        run(&app, &reader, json!({"action":"push.remove","endpoint":endpoint})).unwrap();
+        assert_eq!(run(&app, &reader, json!({"action":"push.list"})).unwrap()["endpoints"], json!([]));
     }
 
     #[test]
