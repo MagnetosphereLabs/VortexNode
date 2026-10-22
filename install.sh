@@ -5,9 +5,15 @@ umask 077
 ACTION="${1:-install}"
 [[ $# -eq 0 ]] || shift
 REPOSITORY=""
+APPLICATIONS=""
 while [[ $# -gt 0 ]]; do
-  case "$1" in --repo) REPOSITORY="${2:?Missing GitHub repository URL}"; shift 2;; *) echo "Unknown argument: $1" >&2; exit 1;; esac
+  case "$1" in
+    --repo) REPOSITORY="${2:?Missing GitHub repository URL}"; shift 2;;
+    --apps) APPLICATIONS="${2:?Choose chat or both}"; shift 2;;
+    *) echo "Unknown argument: $1" >&2; exit 1;;
+  esac
 done
+[[ -z "$APPLICATIONS" || "$APPLICATIONS" == chat || "$APPLICATIONS" == both ]] || { echo '--apps must be chat or both.' >&2; exit 1; }
 [[ $EUID -eq 0 ]] || { echo 'Run this installer with sudo.' >&2; exit 1; }
 [[ "$ACTION" == install || "$ACTION" == update ]] || { echo 'Usage: install.sh install --repo GITHUB_URL | install.sh update' >&2; exit 1; }
 [[ -r /etc/os-release ]] || { echo 'Ubuntu is required.' >&2; exit 1; }
@@ -58,16 +64,22 @@ if [[ -f "$CONFIG" ]]; then
 import json,sys
 c=json.load(open(sys.argv[1]))
 for k in ('repository','domain','email','listen','node_id','bridge'): print(c[k])
+print('both' if c.get('vault_enabled',True) else 'chat')
 PY
   )
   REPOSITORY="${REPOSITORY:-${SAVED[0]}}"
   DOMAIN="${SAVED[1]}"; EMAIL="${SAVED[2]}"; LISTEN="${SAVED[3]}"; NODE_ID="${SAVED[4]}"; BRIDGE="${SAVED[5]}"
+  APPLICATIONS="${APPLICATIONS:-${SAVED[6]}}"
   ACTION=update
 else
   for owned_path in "$SITE" /etc/systemd/system/vortex-node.service /etc/systemd/system/vortex-node.socket; do
     [[ ! -e "$owned_path" ]] || { echo "An existing configuration occupies $owned_path. It was left untouched." >&2; exit 1; }
   done
   [[ "$ACTION" != update ]] || { echo 'No Node installation found.' >&2; exit 1; }
+  if [[ -z "$APPLICATIONS" ]]; then
+    read -r -p 'Applications: Chat and Vault [1], Chat only [2] (default 1): ' APP_CHOICE </dev/tty
+    case "$APP_CHOICE" in ''|1) APPLICATIONS=both;; 2) APPLICATIONS=chat;; *) echo 'Choose 1 or 2.' >&2; exit 1;; esac
+  fi
   read -r -p 'Domain or subdomain pointing to this server: ' DOMAIN </dev/tty
   read -r -p 'Email for your HTTPS certificate account: ' EMAIL </dev/tty
   echo 'HTTPS certificates use the Let’s Encrypt subscriber agreement: https://letsencrypt.org/repository/'
@@ -183,11 +195,11 @@ else:raise SystemExit('No available private port')
 PY
 )
 fi
-python3 - "$CONFIG" "$REPOSITORY" "$DOMAIN" "$EMAIL" "$LISTEN" "$NODE_ID" "$BRIDGE" <<'PY'
+python3 - "$CONFIG" "$REPOSITORY" "$DOMAIN" "$EMAIL" "$LISTEN" "$NODE_ID" "$BRIDGE" "$APPLICATIONS" <<'PY'
 import json,os,sys
-path,repo,domain,email,listen,node,bridge=sys.argv[1:]
+path,repo,domain,email,listen,node,bridge,applications=sys.argv[1:]
 previous=json.load(open(path)) if os.path.exists(path) else {}
-c=dict(repository=repo,domain=domain,email=email,listen=listen,node_id=node,bridge=bridge,data_dir='/var/lib/vortex-node',vault_html='/opt/vortex-node/current/vault.html',reserve_bytes=10_000_000_000)
+c=dict(repository=repo,domain=domain,email=email,listen=listen,node_id=node,bridge=bridge,data_dir='/var/lib/vortex-node',vault_html='/opt/vortex-node/current/vault.html',reserve_bytes=previous.get('reserve_bytes',10_000_000_000),vault_enabled=applications=='both')
 for key in ('media','media_ports'):
  if key in previous:c[key]=previous[key]
 tmp=path+'.new'

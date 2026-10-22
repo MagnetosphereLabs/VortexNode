@@ -2609,6 +2609,7 @@ mod polish_tests {
         .unwrap();
         let app = Arc::new(Inner {
             cfg: Config {
+                vault_enabled: true,
                 email: default_email(),
                 media: None,
                 listen: "127.0.0.1:0".into(),
@@ -2641,6 +2642,27 @@ mod polish_tests {
         );
         (dir, app, owner, reader, key, owner_id, reader_id)
     }
+    #[tokio::test]
+    async fn chat_only_mode_unmounts_vault_without_removing_accounts_or_chat() {
+        use tower::ServiceExt;
+        let (_dir, mut app, _, _, _, _, _) = fixture();
+        Arc::get_mut(&mut app).unwrap().cfg.vault_enabled = false;
+        let gate = format!("/gate/{}/vaults", app.cfg.bridge);
+        let router = router(app).layer(axum::Extension(ConnectInfo(
+            "127.0.0.1:4242".parse::<SocketAddr>().unwrap(),
+        )));
+        for path in ["/vault", "/vault/", "/receive/", &gate] {
+            let response = router.clone().oneshot(axum::http::Request::builder()
+                .uri(path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        for path in ["/", "/chat", "/health", "/connect"] {
+            let response = router.clone().oneshot(axum::http::Request::builder()
+                .uri(path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+    }
+
     fn run(app: &App, h: &HeaderMap, value: Value) -> Api<Value> {
         dispatch(
             app,

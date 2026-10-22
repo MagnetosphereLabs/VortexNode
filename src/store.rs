@@ -889,6 +889,7 @@ mod tests {
             .unwrap();
         let a = Arc::new(Inner {
             cfg: Config {
+                vault_enabled: true,
                 media:None,
                 email:default_email(),
                 listen: "127.0.0.1:0".into(),

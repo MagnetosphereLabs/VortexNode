@@ -1,0 +1,22 @@
+name: Verify Node
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: node-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install Rust
+        run: rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
+      - name: Check installer syntax
+        run: bash -n install.sh uninstall.sh media/setup.sh
+      - name: Test security and storage boundaries
+        run: cargo test --locked
+      - name: Build release
+        run: cargo build --release --locked

@@ -49,6 +49,9 @@ const UPLOAD_SECONDS: i64 = 24 * 60 * 60;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {
+    /// Disabled applications are not mounted in the HTTP router.
+    #[serde(default = "default_enabled")]
+    vault_enabled: bool,
     #[serde(default = "default_email")]
     email: String,
     #[serde(default)]
@@ -61,6 +64,7 @@ struct Config {
     #[serde(default = "default_floor")]
     reserve_bytes: u64,
 }
+fn default_enabled() -> bool { true }
 fn default_email()->String{"security@localhost.invalid".into()}
 fn default_floor() -> u64 {
     FLOOR
@@ -357,7 +361,7 @@ fn initialize(path: &Path) -> Result<Connection> {
 
 async fn info(State(a): State<App>) -> Json<Value> {
     Json(
-        json!({"node":a.cfg.node_id,"gate":format!("/gate/{}",a.cfg.bridge),"release":"2.3","chunk":BLOCK,"maxShare":MAX_SHARE,"storage":4,"catalogPage":256,"metadataPage":65536,"maxVault":MAX_VAULT}),
+        json!({"node":a.cfg.node_id,"gate":format!("/gate/{}",a.cfg.bridge),"release":"2.3","chunk":BLOCK,"maxShare":MAX_SHARE,"storage":4,"catalogPage":256,"metadataPage":65536,"maxVault":MAX_VAULT,"applications":{"chat":true,"vault":a.cfg.vault_enabled}}),
     )
 }
 async fn health() -> Json<Value> {
@@ -1640,6 +1644,13 @@ async fn vault_html(State(a): State<App>) -> Api<Response> {
     let html = tokio::fs::read(&a.cfg.vault_html).await?;
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
+async fn application_home(State(a): State<App>) -> Api<Response> {
+    if a.cfg.vault_enabled {
+        vault_html(State(a)).await
+    } else {
+        Ok(chat::html().await)
+    }
+}
 async fn gate_guard(
     State(a): State<App>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1657,7 +1668,7 @@ async fn gate_guard(
 }
 fn router(a: App) -> Router {
     let gate = format!("/gate/{}", a.cfg.bridge);
-    let routes = Router::new()
+    let common_routes = Router::new()
         .route(
             "/session",
             post(login).get(current).layer(DefaultBodyLimit::max(4096)),
@@ -1665,10 +1676,11 @@ fn router(a: App) -> Router {
         .route("/forget", post(forget))
         .route("/preferences", post(preferences))
         .route("/panic", post(panic_logout))
+        .route("/activity", get(activity));
+    let vault_routes = Router::new()
         .route("/vault/{id}/remember", post(remember_vault))
         .route("/vault/{id}/remember/resume", post(resume_vault))
         .route("/vault/{id}/remember/forget", post(forget_vault))
-        .route("/activity", get(activity))
         .route("/vaults", get(vaults).post(create_vault))
         .route("/vault/{id}", get(manifest).delete(remove_vault))
         .route("/vault/{id}/stage", post(stage))
@@ -1698,13 +1710,28 @@ fn router(a: App) -> Router {
             put(share_piece).layer(DefaultBodyLimit::max(MAX_BLOCK)),
         )
         .route("/share/{id}/publish", post(publish))
-        .route("/share/{id}", delete(revoke))
+        .route("/share/{id}", delete(revoke));
+    let routes = if a.cfg.vault_enabled { common_routes.merge(vault_routes) } else { common_routes }
         .layer(axum::middleware::from_fn_with_state(a.clone(), gate_guard));
+    let public_vault_routes = Router::new()
+        .route("/download/{ticket}", get(export::download))
+        .route("/receive/", get(receive_html))
+        .route("/receive/{id}", get(receive_html))
+        .route("/receive/worker.js", get(worker))
+        .route("/receive/export", get(export_html))
+        .route("/receive/preview/{id}", post(preview).layer(DefaultBodyLimit::max(4096)))
+        .route("/receive/claim/{id}", post(claim).layer(DefaultBodyLimit::max(4096)))
+        .route("/receive/piece/{id}/{n}", get(receive_piece))
+        .route("/receive/complete/{id}", post(complete).layer(DefaultBodyLimit::max(4096)))
+        .route("/vault", get(vault_html))
+        .route("/vault/", get(vault_html))
+        .route("/Vault", get(vault_html));
+    let public_routes = if a.cfg.vault_enabled { public_vault_routes } else { Router::new() };
     Router::new()
+        .merge(public_routes)
         .route("/connect", get(info))
         .route("/health", get(health))
-        .route("/download/{ticket}", get(export::download))
-        .route("/", get(vault_html))
+        .route("/", get(application_home))
         .route("/chat", get(chat::html))
         .route("/chat/", get(chat::html))
         .route("/chat/action", post(chat::action).layer(DefaultBodyLimit::max(2*1024*1024)))
@@ -1719,26 +1746,6 @@ fn router(a: App) -> Router {
         .route("/chat/worker.js", get(chat::sw))
         .route("/chat/manifest.webmanifest", get(chat::manifest))
         .route("/chat/icon.svg", get(chat::icon))
-        .route("/receive/", get(receive_html))
-        .route("/receive/{id}", get(receive_html))
-        .route("/receive/worker.js", get(worker))
-        .route("/receive/export", get(export_html))
-        .route(
-            "/receive/preview/{id}",
-            post(preview).layer(DefaultBodyLimit::max(4096)),
-        )
-        .route(
-            "/receive/claim/{id}",
-            post(claim).layer(DefaultBodyLimit::max(4096)),
-        )
-        .route("/receive/piece/{id}/{n}", get(receive_piece))
-        .route(
-            "/receive/complete/{id}",
-            post(complete).layer(DefaultBodyLimit::max(4096)),
-        )
-        .route("/vault", get(vault_html))
-        .route("/vault/", get(vault_html))
-        .route("/Vault", get(vault_html))
         .nest(&gate, routes)
         .layer(axum::middleware::from_fn_with_state(a.clone(),traffic::guard))
         .layer(DefaultBodyLimit::max(2 * MAX_MANIFEST + 65536))
