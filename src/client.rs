@@ -85,6 +85,17 @@ pub async fn index(State(a): State<App>) -> Api<Response> {
     Ok(([(header::CONTENT_TYPE,"text/html; charset=utf-8"),(header::CONTENT_SECURITY_POLICY,policy.as_str())],html).into_response())
 }
 
+pub fn is_static_asset(path: &str) -> bool {
+    path.starts_with("/assets/") && path.len() <= 512
+        && path.split('/').skip(1).all(|part| !part.is_empty() && !part.starts_with('.') && !part.contains('%') && !part.contains('\\'))
+}
+
+fn immutable_asset(path: &str) -> bool {
+    is_static_asset(path) && path.rsplit('/').next().and_then(|name| name.split_once('.'))
+        .is_some_and(|(hash, extension)| hash.len() >= 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            && matches!(extension, "js" | "css" | "wasm" | "woff2" | "png" | "webp" | "svg"))
+}
+
 pub async fn file(State(a): State<App>, request: axum::extract::Request) -> Api<Response> {
     if request.method() != axum::http::Method::GET { return Err(Fault(StatusCode::NOT_FOUND,"Not found")) }
     let path = request.uri().path().trim_start_matches('/');
@@ -107,12 +118,23 @@ pub async fn file(State(a): State<App>, request: axum::extract::Request) -> Api<
         "ogg"=>"audio/ogg", "mp3"=>"audio/mpeg", "txt"=>"text/plain; charset=utf-8",
         _=>return Err(Fault(StatusCode::NOT_FOUND,"Not found")),
     };
-    Ok(([(header::CONTENT_TYPE,content_type)],tokio::fs::read(file).await?).into_response())
+    let cache = if immutable_asset(request.uri().path()) { "public, max-age=31536000, immutable" } else { "no-store" };
+    Ok(([(header::CONTENT_TYPE,content_type),(header::CACHE_CONTROL,cache)],tokio::fs::read(file).await?).into_response())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_asset_budget_and_cache_exclude_api_and_navigation_paths() {
+        assert!(immutable_asset("/assets/5cc7184ebb75f550.js"));
+        assert!(is_static_asset("/assets/named-worker.js"));
+        assert!(!immutable_asset("/assets/named-worker.js"));
+        for path in ["/chat/action", "/chat/object/123/0", "/login", "/assets/../chat/action", "/assets/%2e%2e/chat/action", "/assets"] {
+            assert!(!is_static_asset(path), "{path}");
+        }
+    }
 
     #[test]
     fn connection_policy_names_only_the_node_and_its_media_relay() {

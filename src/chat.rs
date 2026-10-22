@@ -2014,7 +2014,9 @@ pub async fn media_token(
         let id = fluxer_user_id(&u.id);
         format!("user_{id}_{connection}")
     } else { format!("{}:{}",u.id,device) };
-    let claims = json!({"iss":cfg.key,"sub":identity,"nbf":now()-5,"exp":now()+120,"video":{"roomJoin":true,"room":room,"canPublish":true,"canSubscribe":true,"canPublishData":false}});
+    // The Vortex client encrypts its codec negotiation and screen-share control
+    // packets with the same participant-owned key provider as its media tracks.
+    let claims = json!({"iss":cfg.key,"sub":identity,"nbf":now()-5,"exp":now()+120,"video":{"roomJoin":true,"room":room,"canPublish":true,"canSubscribe":true,"canPublishData":v["client"] == "fluxer"}});
     Ok(Json(
         json!({"url":cfg.url,"token":jwt(&cfg.key,&cfg.secret,claims)}),
     ))
@@ -3212,6 +3214,12 @@ mod polish_tests {
         assert_eq!(claims["sub"], format!("{reader_id}:{device}"));
         assert_eq!(claims["video"]["room"], room);
         assert_eq!(claims["video"]["canPublishData"], false);
+        let fluxer = media_token(State(app.clone()), reader.clone(), Json(json!({
+            "room":room,"device":device,"client":"fluxer","connection":"test-connection-1234"
+        }))).await.unwrap().0;
+        let claims: Value = serde_json::from_slice(&B64.decode(fluxer["token"].as_str().unwrap().split('.').nth(1).unwrap()).unwrap()).unwrap();
+        assert_eq!(claims["video"]["canPublishData"], true);
+        assert_eq!(claims["sub"], format!("user_{}_test-connection-1234", fluxer_user_id(&reader_id)));
         assert_eq!(
             media_token(State(app.clone()), owner, Json(value.clone()))
                 .await

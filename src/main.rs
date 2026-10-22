@@ -1771,7 +1771,7 @@ fn router(a: App) -> Router {
                 ])
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
         )
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
         ))

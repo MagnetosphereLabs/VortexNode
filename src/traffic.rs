@@ -7,6 +7,8 @@ struct Peer {
     at: Instant,
     seen: Instant,
     authenticated: Option<Instant>,
+    asset_tokens: f64,
+    asset_at: Instant,
 }
 pub struct Traffic {
     peers: HashMap<String, Peer>,
@@ -22,6 +24,9 @@ impl Default for Traffic {
 }
 impl Traffic {
     fn admit(&mut self, address: &str, authenticated: bool, cost: f64) -> bool {
+        self.admit_for(address, authenticated, cost, false)
+    }
+    fn admit_for(&mut self, address: &str, authenticated: bool, cost: f64, asset: bool) -> bool {
         let t = Instant::now();
         while self
             .newcomers
@@ -54,7 +59,20 @@ impl Traffic {
             at: t,
             seen: t,
             authenticated: None,
+            asset_tokens: 1024.,
+            asset_at: t,
         });
+        p.seen = t;
+        if asset {
+            // A split client loads hundreds of public chunks. Those requests must
+            // neither exhaust the API budget nor acquire authenticated capacity.
+            let (refill, burst) = if surge { (16., 512.) } else { (64., 1024.) };
+            p.asset_tokens = (p.asset_tokens + t.duration_since(p.asset_at).as_secs_f64() * refill).min(burst);
+            p.asset_at = t;
+            if p.asset_tokens < cost { return false; }
+            p.asset_tokens -= cost;
+            return true;
+        }
         let familiar = p
             .authenticated
             .is_some_and(|x| t.duration_since(x) < Duration::from_secs(86400));
@@ -87,8 +105,9 @@ pub async fn guard(
     next: axum::middleware::Next,
 ) -> Response {
     let address = ip(request.headers(), peer);
-    let authenticated = session(&a, request.headers(), peer).is_ok()
-        || chat::authenticated(&a, request.headers()).unwrap_or(false);
+    let asset = request.method() == axum::http::Method::GET && client::is_static_asset(request.uri().path());
+    let authenticated = !asset && (session(&a, request.headers(), peer).is_ok()
+        || chat::authenticated(&a, request.headers()).unwrap_or(false));
     let cost = if request.method() == axum::http::Method::OPTIONS {
         0.25
     } else if request.uri().path().contains("/object/") {
@@ -99,7 +118,7 @@ pub async fn guard(
     let allowed = a
         .traffic
         .lock()
-        .map(|mut t| t.admit(&address, authenticated, cost))
+        .map(|mut t| if asset { t.admit_for(&address, false, cost, true) } else { t.admit(&address, authenticated, cost) })
         .unwrap_or(false);
     if !allowed {
         let mut r = Fault(StatusCode::TOO_MANY_REQUESTS, "Please retry shortly").into_response();
@@ -154,5 +173,15 @@ mod tests {
         let mut t = Traffic::default();
         assert!(t.admit("2001:db8::1", false, 79.));
         assert!(!t.admit("2001:db8::2", false, 10.));
+    }
+    #[test]
+    fn client_chunks_have_a_bounded_budget_independent_of_api_requests() {
+        let mut t = Traffic::default();
+        let peer = "192.0.2.1";
+        assert!(t.admit(peer, false, 79.));
+        for _ in 0..800 { assert!(t.admit_for(peer, false, 1., true)); }
+        assert!(!t.admit(peer, false, 10.), "assets must not replenish the API budget");
+        assert!(!t.admit_for(peer, false, 2048., true), "static traffic remains bounded");
+        assert!(t.admit(peer, true, 1.), "authenticated chat retains capacity");
     }
 }
