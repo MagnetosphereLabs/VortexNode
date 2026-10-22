@@ -6,10 +6,12 @@ ACTION="${1:-install}"
 [[ $# -eq 0 ]] || shift
 REPOSITORY=""
 APPLICATIONS=""
+SOURCE_REF=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo) REPOSITORY="${2:?Missing GitHub repository URL}"; shift 2;;
     --apps) APPLICATIONS="${2:?Choose chat or both}"; shift 2;;
+    --ref) SOURCE_REF="${2:?Missing release tag, branch or commit}"; shift 2;;
     *) echo "Unknown argument: $1" >&2; exit 1;;
   esac
 done
@@ -65,11 +67,13 @@ import json,sys
 c=json.load(open(sys.argv[1]))
 for k in ('repository','domain','email','listen','node_id','bridge'): print(c[k])
 print('both' if c.get('vault_enabled',True) else 'chat')
+print(c.get('source_ref','main'))
 PY
   )
   REPOSITORY="${REPOSITORY:-${SAVED[0]}}"
   DOMAIN="${SAVED[1]}"; EMAIL="${SAVED[2]}"; LISTEN="${SAVED[3]}"; NODE_ID="${SAVED[4]}"; BRIDGE="${SAVED[5]}"
   APPLICATIONS="${APPLICATIONS:-${SAVED[6]}}"
+  SOURCE_REF="${SOURCE_REF:-${SAVED[7]}}"
   ACTION=update
 else
   for owned_path in "$SITE" /etc/systemd/system/vortex-node.service /etc/systemd/system/vortex-node.socket; do
@@ -89,6 +93,8 @@ else
   BRIDGE=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
 fi
 [[ "$REPOSITORY" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\.git)?/?$ ]] || { echo 'Supply --repo with your public GitHub repository HTTPS URL.' >&2; exit 1; }
+SOURCE_REF="${SOURCE_REF:-main}"
+[[ "$SOURCE_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$SOURCE_REF" != *..* ]] || { echo 'Invalid source ref.' >&2; exit 1; }
 DOMAIN=$(python3 - "$DOMAIN" <<'PY'
 import re,sys
 s=sys.argv[1].rstrip('.').encode('idna').decode().lower()
@@ -132,11 +138,14 @@ install -d -m 755 "$ROOT/releases" "$WEBROOT/.well-known/acme-challenge"
 install -d -m 700 -o vortex-build -g vortex-build /var/cache/vortex-node-build
 
 echo 'Downloading and compiling the Node as an unprivileged build user…'
-git -c protocol.file.allow=never clone --depth 1 --quiet -- "$REPOSITORY" "$WORK/source"
+git init --quiet "$WORK/source"
+git -C "$WORK/source" -c protocol.file.allow=never fetch --depth 1 --quiet "$REPOSITORY" "$SOURCE_REF"
+git -C "$WORK/source" checkout --quiet --detach FETCH_HEAD
 COMMIT=$(git -C "$WORK/source" rev-parse HEAD)
 SOURCE="$WORK/source"
 [[ ! -f "$SOURCE/VortexNode/Cargo.toml" ]] || SOURCE="$SOURCE/VortexNode"
 [[ -f "$SOURCE/Cargo.toml" && -f "$SOURCE/Cargo.lock" && -f "$SOURCE/src/main.rs" ]] || { echo 'The repository is missing the Node Rust sources or Cargo.lock.' >&2; exit 1; }
+[[ -f "$SOURCE/clients.lock.json" ]] || { echo 'This Node revision has no verified Chat release. The existing installation was not changed.' >&2; exit 1; }
 chmod 755 "$WORK"
 chmod -R a+rX "$WORK/source"
 if [[ ! -x /var/cache/vortex-node-build/cargo/bin/cargo ]]; then
@@ -147,7 +156,10 @@ fi
 runuser -u vortex-build -- env PATH=/var/cache/vortex-node-build/cargo/bin:/usr/sbin:/usr/bin:/sbin:/bin CARGO_HOME=/var/cache/vortex-node-build/cargo RUSTUP_HOME=/var/cache/vortex-node-build/rustup CARGO_TARGET_DIR=/var/cache/vortex-node-build/target /var/cache/vortex-node-build/cargo/bin/cargo build --manifest-path "$SOURCE/Cargo.toml" --release --locked
 RELEASE="$ROOT/releases/$COMMIT"
 install -d -m 755 "$RELEASE"
-install -m 755 /var/cache/vortex-node-build/target/release/vortex-node "$RELEASE/vortex-node"
+install -m 755 /var/cache/vortex-node-build/target/release/vortex-node "$RELEASE/vortex-node.new"
+mv -f "$RELEASE/vortex-node.new" "$RELEASE/vortex-node"
+echo 'Installing the verified Vortex Chat web client…'
+python3 "$SOURCE/scripts/install-chat-client.py" "$SOURCE/clients.lock.json" "$RELEASE/chat"
 # Atomic replacement also makes running the installed updater safe.
 install -m 755 "$SOURCE/install.sh" "$ROOT/install.sh.new"
 mv -f "$ROOT/install.sh.new" "$ROOT/install.sh"
@@ -195,13 +207,13 @@ else:raise SystemExit('No available private port')
 PY
 )
 fi
-python3 - "$CONFIG" "$REPOSITORY" "$DOMAIN" "$EMAIL" "$LISTEN" "$NODE_ID" "$BRIDGE" "$APPLICATIONS" <<'PY'
+python3 - "$CONFIG" "$REPOSITORY" "$DOMAIN" "$EMAIL" "$LISTEN" "$NODE_ID" "$BRIDGE" "$APPLICATIONS" "$SOURCE_REF" <<'PY'
 import json,os,sys
-path,repo,domain,email,listen,node,bridge,applications=sys.argv[1:]
+path,repo,domain,email,listen,node,bridge,applications,source_ref=sys.argv[1:]
 previous=json.load(open(path)) if os.path.exists(path) else {}
-c=dict(repository=repo,domain=domain,email=email,listen=listen,node_id=node,bridge=bridge,data_dir='/var/lib/vortex-node',vault_html='/opt/vortex-node/current/vault.html',reserve_bytes=previous.get('reserve_bytes',10_000_000_000),vault_enabled=applications=='both')
+c={**previous,**dict(repository=repo,source_ref=source_ref,domain=domain,email=email,listen=listen,node_id=node,bridge=bridge,data_dir='/var/lib/vortex-node',vault_html='/opt/vortex-node/current/vault.html',reserve_bytes=previous.get('reserve_bytes',10_000_000_000),vault_enabled=applications=='both')}
 c['public_url']='https://'+domain
-if 'chat_web_dir' in previous:c['chat_web_dir']=previous['chat_web_dir']
+c['chat_web_dir']='/opt/vortex-node/current/chat'
 for key in ('media','media_ports'):
  if key in previous:c[key]=previous[key]
 tmp=path+'.new'
