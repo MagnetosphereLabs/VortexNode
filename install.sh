@@ -111,7 +111,7 @@ if [[ ! -f "$CONFIG" ]] && command -v ss >/dev/null; then
 fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-install-recommends nginx certbot ca-certificates curl git build-essential pkg-config python3 openssl util-linux
+apt-get install -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-install-recommends nginx certbot ca-certificates curl git build-essential pkg-config libssl-dev python3 openssl util-linux
 getent ahosts "$DOMAIN" >/dev/null || { echo 'The domain does not resolve. Point its DNS to this VPS first.' >&2; exit 1; }
 python3 - "$DATA" <<'PY'
 import os,shutil,sys

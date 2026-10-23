@@ -51,6 +51,14 @@ Open the Node’s HTTPS domain for Chat and `/vault` for Vault when enabled. [Vo
 
 The Node owner controls registration and invitations, account availability, per-user storage allowances and upload limits through the client’s Node settings. Owning the Node does not automatically make the owner a participant in private conversations.
 
+## Source-built client updates
+
+For the existing configured Linux checkout, run `bash "$HOME/VortexChat-Local/scripts/update-local.sh"` as the desktop user. It builds both clients locally, updates this backend when needed, then deploys the matching web client. Use that combined path while testing integration source; the published client lock above still selects rc.1.
+
+The shared interface supports encrypted profiles, Node-wide and server expressions, private account-addressed server invitations, and Node account security. Password replacement rewraps the existing account keys on the client. Passkeys require WebAuthn PRF support on the Node website. Backend compilation requires OpenSSL development headers, installed by `install.sh` on supported Ubuntu hosts.
+
+Chat permits framing by the same Node origin so Vault can embed it. Other origins remain excluded by the frame policy. Communication privacy settings are enforced using account relationship metadata while message and media contents remain encrypted.
+
 ## Security boundaries
 
 A session authorizes access to encrypted records. It is not a decryption key. The server still sees routing metadata, account and membership identifiers, sizes, timing and network addresses. A web client also trusts the host supplying its JavaScript. Installed clients bundle their renderer, but still depend on a trusted device and release supply chain.

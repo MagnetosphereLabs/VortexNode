@@ -30,7 +30,7 @@ pub async fn discovery(State(a): State<App>) -> Api<Json<Value>> {
         "endpoints":{"api":api,"api_client":api,"api_public":api,"gateway":ws,
             "media":format!("{origin}/vortex/media"),"static_cdn":format!("{origin}/vortex/assets"),
             "marketing":origin,"admin":format!("{origin}/node-settings"),
-            "invite":format!("{origin}/invite"),"gift":origin,"webapp":origin},
+            "invite":format!("{origin}/invite"),"gift":format!("{origin}/gift"),"webapp":origin},
         "captcha":{"provider":"none"},
         "features":{"voice_enabled":a.cfg.media.is_some(),"stripe_enabled":false,"stripe_serviceable":false,
             "premium_enabled":false,"self_hosted":true,"presigned_attachment_uploads":false,
@@ -90,7 +90,7 @@ pub async fn index(State(a): State<App>) -> Api<Response> {
         .replace("<title>Fluxer</title>", "<title>Vortex Chat</title>");
     html = html.replace("<script src=", &format!("<script nonce=\"{nonce}\" src="));
     let connections = connection_sources(a.cfg.public_url.as_deref(), a.cfg.media.as_ref().map(|media| media.url.as_str()))?;
-    let policy = format!("default-src 'none'; script-src 'self' 'nonce-{nonce}' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self' data:; media-src 'self' blob: mediastream:; connect-src {connections}; worker-src 'self' blob:; manifest-src 'self'; frame-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+    let policy = format!("default-src 'none'; script-src 'self' 'nonce-{nonce}' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self' data:; media-src 'self' blob: mediastream:; connect-src {connections}; worker-src 'self' blob:; manifest-src 'self'; frame-src 'self' blob:; frame-ancestors 'self'; base-uri 'none'; form-action 'self'");
     Ok(([(header::CONTENT_TYPE,"text/html; charset=utf-8"),(header::CONTENT_SECURITY_POLICY,policy.as_str())],html).into_response())
 }
 
@@ -110,7 +110,7 @@ pub async fn file(State(a): State<App>, request: axum::extract::Request) -> Api<
     let path = request.uri().path().trim_start_matches('/');
     let Some(root) = &a.cfg.chat_web_dir else { return Err(Fault(StatusCode::NOT_FOUND,"Not found")) };
     // Only UI navigation paths get the SPA fallback. Missing API endpoints never do.
-    if path == "login" || path == "register" || path == "node-settings" || path.starts_with("channels/") || path.starts_with("invite/") {
+    if path == "login" || path == "register" || path == "node-settings" || path == "settings/user" || path.starts_with("channels/") || path.starts_with("invite/") {
         return index(State(a)).await;
     }
     if path.len()>512 || path.split('/').any(|s|s==".." || s.starts_with('.')) {

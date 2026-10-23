@@ -1,5 +1,9 @@
 //! Chat stores ciphertext and routing/permission metadata. No content keys live here.
 use super::*;
+#[path = "chat_security.rs"]
+mod security;
+#[path = "chat_privacy.rs"]
+mod privacy;
 use opaque_ke::{
     CipherSuite, CredentialFinalization, CredentialRequest, RegistrationRequest,
     RegistrationUpload, ServerLogin, ServerLoginParameters, ServerRegistration, ServerSetup,
@@ -216,8 +220,8 @@ fn devices(c: &Connection, id: &str) -> Api<Value> {
     Ok(json!(rows))
 }
 fn directory(c: &Connection) -> Api<Value> {
-    let mut q=c.prepare("SELECT id,username,display,identity,profile,CASE WHEN status='invisible' OR NOT EXISTS(SELECT 1 FROM chat_activity WHERE user=chat_users.id AND at>unixepoch()-90) THEN 'offline' WHEN status='online' AND NOT EXISTS(SELECT 1 FROM chat_activity WHERE user=chat_users.id AND at>unixepoch()-45 AND idle=0) THEN 'idle' ELSE status END,created,node_owner IS NOT NULL FROM chat_users WHERE disabled=0 ORDER BY username LIMIT 4096")?;
-    let rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"username":r.get::<_,String>(1)?,"display":r.get::<_,String>(2)?,"identity":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(Value::Null),"profile":!r.get::<_,String>(4)?.is_empty(),"status":r.get::<_,String>(5)?,"created":r.get::<_,i64>(6)?,"owner":r.get::<_,bool>(7)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    let mut q=c.prepare("SELECT id,username,display,identity,profile!='',CASE WHEN status='invisible' OR NOT EXISTS(SELECT 1 FROM chat_activity WHERE user=chat_users.id AND at>unixepoch()-90) THEN 'offline' WHEN status='online' AND NOT EXISTS(SELECT 1 FROM chat_activity WHERE user=chat_users.id AND at>unixepoch()-45 AND idle=0) THEN 'idle' ELSE status END,created,node_owner IS NOT NULL,profile_version FROM chat_users WHERE disabled=0 ORDER BY username LIMIT 4096")?;
+    let rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"username":r.get::<_,String>(1)?,"display":r.get::<_,String>(2)?,"identity":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(Value::Null),"profile":r.get::<_,bool>(4)?,"status":r.get::<_,String>(5)?,"created":r.get::<_,i64>(6)?,"owner":r.get::<_,bool>(7)?,"profile_version":r.get::<_,i64>(8)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     Ok(json!(rows))
 }
 // Only public signing/exchange keys survive account deletion, so shared history
@@ -282,6 +286,8 @@ fn setup(c: &Connection) -> Api<ServerSetup<Suite>> {
 }
 
 pub fn initialize(c: &Connection) -> Result<()> {
+    security::initialize(c)?;
+    privacy::initialize(c)?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS chat_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS chat_users(id TEXT PRIMARY KEY,username TEXT NOT NULL UNIQUE,node_owner INTEGER UNIQUE,registration TEXT NOT NULL,bundle TEXT NOT NULL,identity TEXT NOT NULL,display TEXT NOT NULL,profile TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'online',disabled INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL,totp TEXT NOT NULL DEFAULT '',last_totp INTEGER NOT NULL DEFAULT -1,quota INTEGER NOT NULL DEFAULT 10737418240,can_invite INTEGER NOT NULL DEFAULT 0,can_space INTEGER NOT NULL DEFAULT 0);
  CREATE TABLE IF NOT EXISTS chat_sessions(hash TEXT PRIMARY KEY,user TEXT NOT NULL,device TEXT NOT NULL,expires INTEGER NOT NULL,created INTEGER NOT NULL);
@@ -317,6 +323,9 @@ pub fn initialize(c: &Connection) -> Result<()> {
  CREATE TABLE IF NOT EXISTS chat_deleted_users(id TEXT PRIMARY KEY,identity TEXT NOT NULL,devices TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS chat_totp(user TEXT PRIMARY KEY,seed TEXT NOT NULL,expires INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS chat_recovery(user TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(user,hash));")?;
+    if c.prepare("SELECT profile_version FROM chat_users LIMIT 0").is_err() {
+        c.execute_batch("ALTER TABLE chat_users ADD COLUMN profile_version INTEGER NOT NULL DEFAULT 0")?;
+    }
     if c.prepare("SELECT viewing FROM chat_activity LIMIT 0").is_err() {
         c.execute_batch("ALTER TABLE chat_activity ADD COLUMN viewing INTEGER NOT NULL DEFAULT 1")?;
     }
@@ -424,6 +433,7 @@ pub async fn action(
         "presence",
         "emoji.list",
         "emoji.get",
+        "passkey.list",
         "admin.storage",
     ]
     .contains(&name.as_str());
@@ -735,6 +745,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             json!({"token":tok,"id":uid,"owner":own.is_some(),"username":name,"expires":expires,"months":months,"bundle":bundle,"identity":serde_json::from_str::<Value>(&identity).unwrap_or(Value::Null)}),
         );
     }
+    if security::handles(&op) {return security::dispatch(a,h,addr,&v);}
     let u = user(a, h)?;
     let mut c = db(a)?;
     match op.as_str() {
@@ -832,7 +843,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
             Ok(
-                json!({"id":u.id,"owner":u.owner,"canInvite":u.owner || c.query_row("SELECT can_invite FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"canSpace":u.owner || c.query_row("SELECT can_space FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"username":name,"bundle":bundle,"identity":serde_json::from_str::<Value>(&identity).unwrap_or(Value::Null),"totp":!totp.is_empty(),"policy":setting(&c,"policy")?,"limits":{"maxUpload":effective_upload(&c,a)?},"users":directory(&c)?,"formerUsers":former_users(&c)?,"friendIds":friend_ids(&c,&u.id)?,"media":a.cfg.media.is_some(),"months":c.query_row("SELECT months FROM chat_login_policy WHERE user=?",[&u.id],|r|r.get::<_,i64>(0)).optional()?.unwrap_or(12),"preferences":c.query_row("SELECT body FROM chat_preferences WHERE user=?",[&u.id],|r|r.get::<_,String>(0)).optional()?.unwrap_or_default()}),
+                json!({"id":u.id,"owner":u.owner,"canInvite":u.owner || c.query_row("SELECT can_invite FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"canSpace":u.owner || c.query_row("SELECT can_space FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"username":name,"bundle":bundle,"identity":serde_json::from_str::<Value>(&identity).unwrap_or(Value::Null),"totp":!totp.is_empty(),"privacy":privacy::view(&c,&u.id)?,"policy":setting(&c,"policy")?,"limits":{"maxUpload":effective_upload(&c,a)?},"users":directory(&c)?,"formerUsers":former_users(&c)?,"friendIds":friend_ids(&c,&u.id)?,"media":a.cfg.media.is_some(),"months":c.query_row("SELECT months FROM chat_login_policy WHERE user=?",[&u.id],|r|r.get::<_,i64>(0)).optional()?.unwrap_or(12),"preferences":c.query_row("SELECT body FROM chat_preferences WHERE user=?",[&u.id],|r|r.get::<_,String>(0)).optional()?.unwrap_or_default()}),
             )
         }
         "logout" => {
@@ -906,7 +917,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             Ok(json!({"ok":true}))
         }
         "devices" => Ok(json!({"devices":devices(&c,&text(&v,"user"))?})),
-        "directory" => Ok(json!({"users":directory(&c)?,"formerUsers":former_users(&c)?})),
+        "directory" => Ok(json!({"users":directory(&c)?,"formerUsers":former_users(&c)?,"privacy":privacy::view(&c,&u.id)?,"totp":c.query_row("SELECT totp!='' FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?})),
         "session.months" => {
             let months = v["months"].as_u64().unwrap_or(12);
             if !(1..=12).contains(&months) {
@@ -956,6 +967,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             )?;
             Ok(json!({"profile":value}))
         }
+        "privacy" => privacy::update(&mut c,&u.id,&v),
         "friend" => {
             let other = text(&v, "user");
             if other == u.id {
@@ -977,6 +989,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 return Err(denied());
             }
             if c.query_row("SELECT EXISTS(SELECT 1 FROM chat_friends WHERE user=? AND other=? AND status='blocked')",params![other,u.id],|r|r.get::<_,bool>(0))? {return Err(denied())}
+            if kind=="request" && !are_friends(&c,&u.id,&other)? && !privacy::allowed(&c,&u.id,&other,"friend_source_flags")? { return Err(Fault(StatusCode::FORBIDDEN,"This account is not accepting friend requests from you")); }
             let was_request:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM chat_friends WHERE user=? AND other=? AND status='request')",params![u.id,other],|r|r.get(0))?;
             let tx = c.transaction()?;
             if kind == "remove" {
@@ -1039,6 +1052,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             // group with an explicit participant list instead.
             if kind == "dm" && !existing { return Err(denied()); }
             if space.is_empty() {
+                if !existing && !privacy::allowed(&tx,&u.id,&target,"group_dm_add_permission_flags")? {return Err(Fault(StatusCode::FORBIDDEN,"This account does not allow this group invitation"));}
                 let blocked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_friends f JOIN chat_members m ON m.room=? AND m.banned=0 WHERE f.status='blocked' AND ((f.user=m.user AND f.other=?) OR (f.user=? AND f.other=m.user)))", params![room,target,target], |r|r.get(0))?;
                 if blocked { return Err(denied()); }
             } else if tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_space_members WHERE space=? AND user=? AND banned=1)", params![space,target], |r|r.get::<_,bool>(0))? {
@@ -1165,7 +1179,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 return Err(bad("Profile too large"));
             }
             c.execute(
-                "UPDATE chat_users SET display=?,status=?,profile=? WHERE id=?",
+                "UPDATE chat_users SET display=?,status=?,profile=?,profile_version=profile_version+1 WHERE id=?",
                 params![display, status, profile, u.id],
             )?;
             Ok(json!({"ok":true}))
@@ -1307,7 +1321,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             tx.execute("DELETE FROM chat_auth WHERE username=?", [&username])?;
             tx.execute("DELETE FROM chat_invites WHERE creator=?", [&id])?;
             tx.execute("DELETE FROM chat_node_emoji WHERE creator=?", [&id])?;
-            for table in ["chat_sessions", "chat_devices", "chat_activity", "chat_presence", "chat_push", "chat_notices", "chat_login_policy", "chat_preferences", "chat_mutes", "chat_totp", "chat_recovery", "chat_members", "chat_space_members"] {
+            for table in ["chat_sessions", "chat_devices", "chat_activity", "chat_presence", "chat_push", "chat_notices", "chat_login_policy", "chat_preferences", "chat_mutes", "chat_totp", "chat_recovery", "chat_privacy", "chat_passkeys", "chat_security_pending", "chat_members", "chat_space_members"] {
                 tx.execute(&format!("DELETE FROM {table} WHERE user=?"), [&id])?;
             }
             tx.execute("DELETE FROM chat_users WHERE id=?", [&id])?;
@@ -1596,6 +1610,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 if !exists {
                     return Err(bad("Unknown account"));
                 }
+                if space.is_empty() && kind!="dm" && !privacy::allowed(&tx,&u.id,&target,"group_dm_add_permission_flags")? {return Err(Fault(StatusCode::FORBIDDEN,"This account does not allow this group invitation"));}
                 if space.is_empty() && tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_friends WHERE ((user=? AND other=?) OR (user=? AND other=?)) AND status='blocked')",params![u.id,target,target,u.id],|r|r.get::<_,bool>(0))? {return Err(denied())}
                 if !space.is_empty() {
                     tx.execute(
@@ -1832,6 +1847,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 drop(q);
                 for target in recipients {
+                    if kind=="call" && !privacy::allowed(&tx,&u.id,&target,"incoming_call_flags")? {continue;}
                     notify(
                         &tx,
                         &target,
@@ -1875,7 +1891,9 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 |r| r.get(0),
             )?;
             let mut q = c.prepare(&sql)?;
-            let rows=q.query_map(params![room,if before>0{before}else{after}],|r|Ok(json!({"seq":r.get::<_,i64>(0)?,"sender":r.get::<_,String>(1)?,"device":r.get::<_,String>(2)?,"id":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,"body":serde_json::from_str::<Value>(&r.get::<_,String>(5)?).unwrap_or(Value::Null),"at":r.get::<_,i64>(6)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            let mut rows=q.query_map(params![room,if before>0{before}else{after}],|r|Ok(json!({"seq":r.get::<_,i64>(0)?,"sender":r.get::<_,String>(1)?,"device":r.get::<_,String>(2)?,"id":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,"body":serde_json::from_str::<Value>(&r.get::<_,String>(5)?).unwrap_or(Value::Null),"at":r.get::<_,i64>(6)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            let mut callers=HashMap::new();
+            for row in &mut rows {if row["kind"]=="call" {let sender=text(row,"sender");let allowed=if let Some(value)=callers.get(&sender){*value}else{let value=privacy::allowed(&c,&sender,&u.id,"incoming_call_flags")?;callers.insert(sender,value);value};row["ringAllowed"]=json!(allowed);}}
             Ok(json!({"events":rows,"epoch":epoch,"info":info,"cursor":cursor}))
         }
         "notices" => {
@@ -1892,14 +1910,15 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             )?;
             verify_totp(&seed, &text(&v, "otp"), last)
                 .ok_or(bad("Check your authenticator code"))?;
-            c.execute(
-                "UPDATE chat_users SET totp='',last_totp=-1 WHERE id=?",
-                [&u.id],
-            )?;
-            c.execute("DELETE FROM chat_recovery WHERE user=?", [&u.id])?;
+            let tx=c.transaction()?;
+            tx.execute("UPDATE chat_users SET totp='',last_totp=-1 WHERE id=?",[&u.id])?;
+            tx.execute("UPDATE accounts SET totp='',last_totp=-1 WHERE id=(SELECT node_owner FROM chat_users WHERE id=?)",[&u.id])?;
+            tx.execute("DELETE FROM chat_recovery WHERE user=?", [&u.id])?;
+            tx.commit()?;
             Ok(json!({"ok":true}))
         }
         "totp.start" => {
+            if c.query_row("SELECT totp!='' FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))? {return Err(bad("Disable your current authenticator before replacing it"));}
             let seed = base32(&{
                 let mut b = [0; 20];
                 OsRng.fill_bytes(&mut b);
@@ -1917,10 +1936,11 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
             let step = verify_totp(&seed, &text(&v, "otp"), -1)
                 .ok_or(bad("Check your authenticator code"))?;
             let tx = c.transaction()?;
-            tx.execute(
-                "UPDATE chat_users SET totp=?,last_totp=? WHERE id=?",
+            if tx.execute(
+                "UPDATE chat_users SET totp=?,last_totp=? WHERE id=? AND totp=''",
                 params![seed, step, u.id],
-            )?;
+            )? != 1 {return Err(conflict());}
+            tx.execute("UPDATE accounts SET totp=?,last_totp=? WHERE id=(SELECT node_owner FROM chat_users WHERE id=?)",params![seed,step,u.id])?;
             tx.execute("DELETE FROM chat_totp WHERE user=?", [&u.id])?;
             tx.execute("DELETE FROM chat_recovery WHERE user=?", [&u.id])?;
             let codes = (0..10).map(|_| random(12)).collect::<Vec<_>>();
@@ -2715,6 +2735,64 @@ mod polish_tests {
         );
         (dir, app, owner, reader, key, owner_id, reader_id)
     }
+    #[test]
+    fn passkeys_bind_the_account_origin_proof_and_single_use_challenge() {
+        use webauthn_authenticator_rs::{prelude::*,softpasskey::SoftPasskey};
+        let (_dir,mut app,owner,reader,_,owner_id,reader_id)=fixture();
+        Arc::get_mut(&mut app).unwrap().cfg.public_url=Some("https://node.example".into());
+        let proof=random(32);
+        db(&app).unwrap().execute("INSERT INTO chat_sessions VALUES(?,?,'proof',?,?)",params![hash(&proof),reader_id,now()+600,now()]).unwrap();
+        assert!(run(&app,&reader,json!({"action":"passkey.start"})).is_err());
+        let first=run(&app,&reader,json!({"action":"passkey.start","proof":proof})).unwrap();
+        let mut authenticator=WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let response=authenticator.do_registration(Url::parse("https://node.example").unwrap(),serde_json::from_value(first["options"].clone()).unwrap()).unwrap();
+        let finish=json!({"action":"passkey.finish","proof":proof,"id":first["id"],"credential":response,"name":"Test passkey","wrapped":B64.encode([7u8;64]),"salt":B64.encode([8u8;32])});
+        run(&app,&reader,finish.clone()).unwrap();
+        assert!(run(&app,&reader,finish).is_err(),"Registration challenges cannot be replayed");
+        assert_eq!(run(&app,&reader,json!({"action":"passkey.list"})).unwrap()["keys"].as_array().unwrap().len(),1);
+        assert!(run(&app,&owner,json!({"action":"passkey.list"})).unwrap()["keys"].as_array().unwrap().is_empty());
+        let login=run(&app,&HeaderMap::new(),json!({"action":"auth.passkey.start","username":"reader.user"})).unwrap();
+        let other=run(&app,&HeaderMap::new(),json!({"action":"auth.passkey.start","username":"reader.user"})).unwrap();
+        assert_ne!(login["id"],other["id"]);
+        let wrong_origin=authenticator.do_authentication(Url::parse("https://node.example:444").unwrap(),serde_json::from_value(other["options"].clone()).unwrap()).unwrap();
+        assert!(run(&app,&HeaderMap::new(),json!({"action":"auth.passkey.finish","id":other["id"],"credential":wrong_origin})).is_err(),"A valid credential from another origin cannot authenticate");
+        let options=serde_json::from_value(login["options"].clone()).unwrap();
+        assert!(authenticator.do_authentication(Url::parse("https://attacker.example").unwrap(),options).is_err());
+        let response=authenticator.do_authentication(Url::parse("https://node.example").unwrap(),serde_json::from_value(login["options"].clone()).unwrap()).unwrap();
+        let request=json!({"action":"auth.passkey.finish","id":login["id"],"credential":response});
+        let authenticated=run(&app,&HeaderMap::new(),request.clone()).unwrap();
+        assert_eq!(authenticated["id"],reader_id);assert_eq!(authenticated["owner"],false);
+        assert_eq!(authenticated["wrapped"],B64.encode([7u8;64]));
+        assert!(authenticated.get("root").is_none());
+        assert!(run(&app,&HeaderMap::new(),request).is_err(),"Authentication challenges cannot be replayed");
+        let mut headers=HeaderMap::new();headers.insert(header::AUTHORIZATION,format!("Bearer {}",text(&authenticated,"token")).parse().unwrap());
+        assert_eq!(run(&app,&headers,json!({"action":"me"})).unwrap()["id"],reader_id);
+        assert_ne!(reader_id,owner_id);
+    }
+
+    #[test]
+    fn communication_privacy_is_enforced_before_group_or_friendship_creation() {
+        let (_dir,app,owner,reader,_,owner_id,reader_id)=fixture();
+        run(&app,&reader,json!({"action":"privacy","friend_source_flags":0,"group_dm_add_permission_flags":16,"incoming_call_flags":16})).unwrap();
+        assert!(run(&app,&owner,json!({"action":"friend","user":reader_id,"kind":"request"})).is_err());
+        assert!(!privacy::allowed(&db(&app).unwrap(),&owner_id,&reader_id,"incoming_call_flags").unwrap());
+        assert!(!privacy::allowed(&db(&app).unwrap(),&owner_id,&reader_id,"group_dm_add_permission_flags").unwrap());
+        run(&app,&reader,json!({"action":"privacy","friend_source_flags":1})).unwrap();
+        assert!(!privacy::allowed(&db(&app).unwrap(),&owner_id,&reader_id,"friend_source_flags").unwrap());
+        let common=random(24);
+        {let c=db(&app).unwrap();c.execute("INSERT INTO chat_users(id,username,registration,bundle,identity,display,created) VALUES(?,'common.user','unused','unused','{}','Common',?)",params![common,now()]).unwrap();
+        for (a,b) in [(&owner_id,&common),(&common,&owner_id),(&reader_id,&common),(&common,&reader_id)] {c.execute("INSERT INTO chat_friends VALUES(?,?,'friend')",params![a,b]).unwrap();}}
+        assert!(privacy::allowed(&db(&app).unwrap(),&owner_id,&reader_id,"friend_source_flags").unwrap());
+        db(&app).unwrap().execute("UPDATE chat_friends SET status='blocked' WHERE user=? AND other=?",params![common,owner_id]).unwrap();
+        assert!(!privacy::allowed(&db(&app).unwrap(),&owner_id,&reader_id,"friend_source_flags").unwrap());
+        run(&app,&reader,json!({"action":"privacy","friend_source_flags":4,"group_dm_add_permission_flags":4,"incoming_call_flags":4})).unwrap();
+        run(&app,&owner,json!({"action":"friend","user":reader_id,"kind":"request"})).unwrap();
+        assert!(privacy::allowed(&db(&app).unwrap(),&owner_id,&reader_id,"group_dm_add_permission_flags").unwrap());
+        run(&app,&reader,json!({"action":"friend","user":owner_id,"kind":"block"})).unwrap();
+        assert!(!privacy::allowed(&db(&app).unwrap(),&owner_id,&reader_id,"incoming_call_flags").unwrap());
+        assert!(run(&app,&reader,json!({"action":"privacy","friend_source_flags":999})).is_err());
+    }
+
     #[tokio::test]
     async fn chat_only_mode_unmounts_vault_without_removing_accounts_or_chat() {
         use tower::ServiceExt;
@@ -2757,9 +2835,13 @@ mod polish_tests {
             let landing = router.clone().oneshot(axum::http::Request::builder()
                 .uri(target.to_str().unwrap()).body(axum::body::Body::empty()).unwrap()).await.unwrap();
             assert_eq!(landing.status(), StatusCode::OK);
+            assert!(landing.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("frame-ancestors 'self'"));
+            assert_eq!(landing.headers()[header::X_FRAME_OPTIONS],"SAMEORIGIN");
             let html = axum::body::to_bytes(landing.into_body(), 4096).await.unwrap();
             assert!(String::from_utf8_lossy(&html).contains("<title>Vortex Chat</title>"));
         }
+        let settings=router.clone().oneshot(axum::http::Request::builder().uri("/settings/user?tab=account_security").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(settings.status(),StatusCode::OK);
         for path in ["/chat/not-an-api", "/vortex/api/not-an-api"] {
             let response = router.clone().oneshot(axum::http::Request::builder()
                 .uri(path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
@@ -2906,6 +2988,7 @@ mod polish_tests {
         let result = run(&app, &reader, json!({"action":"totp.finish","otp":code})).unwrap();
         assert_eq!(result["recovery"].as_array().unwrap().len(), 10);
         assert_eq!(db(&app).unwrap().query_row("SELECT totp FROM chat_users WHERE id=?", [&reader_id], |r| r.get::<_, String>(0)).unwrap(), seed);
+        assert!(run(&app,&reader,json!({"action":"totp.start"})).is_err(),"An enabled authenticator cannot be silently replaced");
     }
 
     #[test]
