@@ -1,0 +1,9 @@
+{
+  "protocol_version": 1,
+  "release": "vortex-v0.1.0-rc.1",
+  "source_commit": "261a9ecb4ece935be04ecf6f4d37c2b80d94d971",
+  "web": {
+    "url": "https://github.com/MagnetosphereLabs/VortexChat/releases/download/vortex-v0.1.0-rc.1/vortex-chat-web.tar.gz",
+    "sha256": "50150ad9f15551ce0759946ff902b7c311c0db81c3233405ebd9a76dd8d6d0de"
+  }
+}

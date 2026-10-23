@@ -2,7 +2,7 @@
 
 Vortex Node is a self-hosted Rust backend for Vortex Chat and Vortex Vault. Chat uses the Vortex fork of Fluxer’s web and desktop interface. Messages, attachments and call media are encrypted and decrypted on participants’ devices. Vault keeps its separate application and encrypted storage format.
 
-The `vortex/integration-20261022` branch is an integration preview. Install a published, matched Node and Chat release; development revisions without `clients.lock.json` deliberately refuse installation. Do not point an unmodified Fluxer client at this backend.
+The `vortex/preview` branch installs the matched **0.1.0-rc.1** web/Linux candidate. The Rust backend tested for this pair is `af65f171997af9d21874b443741757580070fc12`; the client source is `261a9ecb4ece935be04ecf6f4d37c2b80d94d971`. This is a candidate for hands-on testing, with additional Fluxer features and security review still required. Do not point an unmodified Fluxer client at this backend.
 
 ## Server installation
 
@@ -10,13 +10,15 @@ The server installer supports Ubuntu 22.04, 24.04 and 26.04 LTS with systemd. Po
 
 Choose **Chat** or **Chat and Vault**. The browser client is installed automatically from the release pinned by the Node revision. Desktop clients are installed on users’ computers separately.
 
-For the existing alpha on `main`:
+For a new installation or to update an existing Node to this candidate, run on the server:
 
 ```bash
-bash -c 'set -e; f="$(mktemp)"; trap '\''rm -f "$f"'\'' EXIT; curl --proto "=https" --tlsv1.2 -fsSL "https://raw.githubusercontent.com/MagnetosphereLabs/VortexNode/main/install.sh" -o "$f"; sudo bash "$f" install --repo "https://github.com/MagnetosphereLabs/VortexNode"'
+(set -e; f="$(mktemp)"; trap 'rm -f "$f"' EXIT; curl --proto '=https' --tlsv1.2 -fsSL 'https://raw.githubusercontent.com/MagnetosphereLabs/VortexNode/vortex/preview/install.sh' -o "$f"; sudo bash "$f" install --repo https://github.com/MagnetosphereLabs/VortexNode --ref vortex/preview)
 ```
 
-That command installs the existing alpha, not the Fluxer integration preview. A matched integration release will supply its own pinned installation command.
+Back up an existing Node's data and configuration before updating. The installer recognizes the existing configuration, preserves its domain and account, and asks for application selection on a fresh installation. Add `--apps chat` or `--apps both` to explicitly select the applications.
+
+This command tracks the matched preview branch for later manual updates. The existing `main` alpha is a different version. The release does not yet implement every upstream Fluxer feature; see the client's [scope and testing guide](https://github.com/MagnetosphereLabs/VortexChat/blob/vortex/integration-20261022/docs/vortex/TESTING.md).
 
 ## Updates and application selection
 
@@ -36,6 +38,14 @@ sudo /opt/vortex-node/install.sh update --apps both
 Disabling Vault does not delete its encrypted data. Keep a backup of the Node data and configuration before upgrades. Clients must preserve their own encryption keys and account recovery material; a server backup alone does not give the operator decryption access.
 
 ## Clients and administration
+
+Install the Linux x86-64 client on your desktop computer with:
+
+```bash
+(set -e; f="$(mktemp)"; trap 'rm -f "$f"' EXIT; curl --proto '=https' --tlsv1.2 -fsSL 'https://raw.githubusercontent.com/MagnetosphereLabs/VortexChat/261a9ecb4ece935be04ecf6f4d37c2b80d94d971/install-linux.py' -o "$f"; sudo python3 "$f" --release vortex-v0.1.0-rc.1)
+```
+
+Then open **Vortex Chat**, choose **Add instance**, and enter your Node's HTTPS domain. Linux requires glibc 2.35 or newer and a working desktop keyring. The installer covers Ubuntu/Debian, Fedora and Arch families. See the [local build guide](https://github.com/MagnetosphereLabs/VortexChat/blob/vortex/integration-20261022/docs/vortex/BUILD_LINUX.md) to compile on your own PC instead.
 
 Open the Node’s HTTPS domain for Chat and `/vault` for Vault when enabled. [Vortex Chat](https://github.com/MagnetosphereLabs/VortexChat) contains the shared web/desktop client, Linux installer, release workflows and platform documentation. Native clients ask for the Node address and account credentials.
 
