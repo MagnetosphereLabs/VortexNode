@@ -71,6 +71,15 @@ fn connection_sources(public_url: Option<&str>, media_url: Option<&str>) -> Api<
     Ok(std::iter::once("'self'".to_owned()).chain(origins).collect::<Vec<_>>().join(" "))
 }
 
+pub async fn chat_entry(State(a): State<App>) -> Api<Response> {
+    if a.cfg.chat_web_dir.is_some() {
+        // The bundled client routes conversations under /channels, not /chat.
+        // Keep the legacy entry URL usable without treating API paths as UI routes.
+        return Ok(axum::response::Redirect::temporary("/channels/@me").into_response());
+    }
+    index(State(a)).await
+}
+
 pub async fn index(State(a): State<App>) -> Api<Response> {
     let Some(root) = &a.cfg.chat_web_dir else { return Ok(chat::html().await) };
     let mut html = tokio::fs::read_to_string(root.join("index.html")).await?;

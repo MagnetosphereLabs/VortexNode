@@ -2706,6 +2706,37 @@ mod polish_tests {
         }
     }
 
+    #[tokio::test]
+    async fn bundled_chat_entry_redirects_to_a_supported_client_route() {
+        use tower::ServiceExt;
+        let (dir, mut app, _, _, _, _, _) = fixture();
+        let web = dir.path().join("web");
+        fs::create_dir(&web).unwrap();
+        fs::write(web.join("index.html"), "<!doctype html><title>Vortex Chat</title>").unwrap();
+        Arc::get_mut(&mut app).unwrap().cfg.chat_web_dir = Some(web);
+        let router = router(app).layer(axum::Extension(ConnectInfo(
+            "127.0.0.1:4242".parse::<SocketAddr>().unwrap(),
+        )));
+        for path in ["/chat", "/chat/"] {
+            let response = router.clone().oneshot(axum::http::Request::builder()
+                .uri(path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
+            assert_eq!(response.headers()[header::LOCATION], "/channels/@me");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let target = response.headers()[header::LOCATION].clone();
+            let landing = router.clone().oneshot(axum::http::Request::builder()
+                .uri(target.to_str().unwrap()).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(landing.status(), StatusCode::OK);
+            let html = axum::body::to_bytes(landing.into_body(), 4096).await.unwrap();
+            assert!(String::from_utf8_lossy(&html).contains("<title>Vortex Chat</title>"));
+        }
+        for path in ["/chat/not-an-api", "/vortex/api/not-an-api"] {
+            let response = router.clone().oneshot(axum::http::Request::builder()
+                .uri(path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
     fn run(app: &App, h: &HeaderMap, value: Value) -> Api<Value> {
         dispatch(
             app,
