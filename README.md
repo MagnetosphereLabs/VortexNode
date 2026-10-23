@@ -80,3 +80,18 @@ sudo /opt/vortex-node/uninstall.sh --delete-data
 ## License
 
 AGPL-3.0-only. Bundled components retain their license notices.
+
+### Capacity-aware Chat limits
+
+Chat can use automatic file and total-storage limits (`maxUpload: 0` and
+`chatQuota: 0` in the authenticated Chat policy). Effective capacity is computed
+from the filesystem holding Node data after the protected free-space reserve
+and pending Chat and Vault transfers. An explicit positive policy value remains
+a lower ceiling. Account and server allowances still apply, and the encrypted
+transfer protocol currently supports plaintext files up to 100 GiB.
+
+`admin.storage` is restricted to the Node administrator and reports the configured
+limits, effective limits, Chat usage, filesystem capacity and remaining space.
+Client discovery and authenticated upload preflight receive the effective file
+limit. Upload reservation remains transactional and enforces capacity again;
+a displayed value is a snapshot, not a promise that disk space is reserved.

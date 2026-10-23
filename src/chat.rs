@@ -123,8 +123,35 @@ const MAX_CHAT_UPLOAD: i64 = 100 * 1024 * 1024 * 1024;
 const MAX_CHAT_QUOTA: i64 = 9_007_199_254_740_991;
 fn chat_limits(c: &Connection) -> Api<(i64, i64)> {
     let policy = setting(c, "policy")?;
-    Ok((policy["maxUpload"].as_i64().unwrap_or(MAX_CHAT_UPLOAD).clamp(1, MAX_CHAT_UPLOAD),
+    Ok((policy["maxUpload"].as_i64().unwrap_or(0).clamp(0, MAX_CHAT_UPLOAD),
         policy["chatQuota"].as_i64().unwrap_or(0).max(0)))
+}
+// Limits are computed from the filesystem that actually holds Node data. Vault
+// deliveries and all pending Chat/Vault reservations share the same headroom.
+fn upload_limit(configured: i64, remaining: i64) -> i64 {
+    let ceiling = if configured == 0 { MAX_CHAT_UPLOAD } else { configured };
+    let mut plain = remaining.max(0).min(ceiling);
+    // Every plaintext chunk gains an authenticated-encryption nonce and tag.
+    let overhead = ((plain + BLOCK as i64 - 1) / BLOCK as i64).max(1) * 28;
+    plain = plain.min(remaining.saturating_sub(overhead).max(0));
+    plain
+}
+pub(super) fn effective_upload(c: &Connection, a: &App) -> Api<i64> {
+    let (upload, quota) = chat_limits(c)?;
+    let disk = available_bytes(c, a)?.min(MAX_CHAT_QUOTA as u64) as i64;
+    let remaining = if quota == 0 { disk } else { disk.min(quota.saturating_sub(chat_storage_used(c)?).max(0)) };
+    Ok(upload_limit(upload, remaining))
+}
+fn storage_view(c: &Connection, a: &App) -> Api<Value> {
+    let (upload, quota) = chat_limits(c)?;
+    let used = chat_storage_used(c)?;
+    let (total, free) = disk_capacity(&a.cfg.data_dir)?;
+    let available = available_bytes(c, a)?.min(MAX_CHAT_QUOTA as u64) as i64;
+    let remaining = if quota == 0 {available} else {available.min(quota.saturating_sub(used).max(0))};
+    Ok(json!({"maxUpload":upload,"quota":quota,"used":used,"diskTotal":total.min(MAX_CHAT_QUOTA as u64),
+        "diskFree":free.min(MAX_CHAT_QUOTA as u64),"reserve":safety_floor(a),"available":available,
+        "remaining":remaining,"effectiveQuota":used.saturating_add(remaining),"effectiveMaxUpload":upload_limit(upload,remaining),
+        "protocolMaxUpload":MAX_CHAT_UPLOAD}))
 }
 fn chat_storage_used(c: &Connection) -> Api<i64> {
     // Count complete files and in-flight reservations, so concurrent uploads cannot overbook.
@@ -275,6 +302,7 @@ pub fn initialize(c: &Connection) -> Result<()> {
  CREATE INDEX IF NOT EXISTS chat_notice_user ON chat_notices(user,id);
  CREATE TABLE IF NOT EXISTS chat_login_policy(user TEXT PRIMARY KEY,months INTEGER NOT NULL CHECK(months BETWEEN 1 AND 12));
  CREATE TABLE IF NOT EXISTS chat_preferences(user TEXT PRIMARY KEY,body TEXT NOT NULL);
+ CREATE INDEX IF NOT EXISTS chat_emoji_history ON chat_events(room,seq) WHERE kind='emoji';
  CREATE TABLE IF NOT EXISTS chat_node_emoji(id TEXT PRIMARY KEY,creator TEXT NOT NULL,body TEXT NOT NULL,audience TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS chat_presence(user TEXT PRIMARY KEY,at INTEGER NOT NULL,idle INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS chat_activity(user TEXT NOT NULL,session TEXT NOT NULL,instance TEXT NOT NULL,at INTEGER NOT NULL,idle INTEGER NOT NULL,PRIMARY KEY(user,session,instance));
@@ -804,7 +832,7 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
             Ok(
-                json!({"id":u.id,"owner":u.owner,"canInvite":u.owner || c.query_row("SELECT can_invite FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"canSpace":u.owner || c.query_row("SELECT can_space FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"username":name,"bundle":bundle,"identity":serde_json::from_str::<Value>(&identity).unwrap_or(Value::Null),"totp":!totp.is_empty(),"policy":setting(&c,"policy")?,"users":directory(&c)?,"formerUsers":former_users(&c)?,"friendIds":friend_ids(&c,&u.id)?,"media":a.cfg.media.is_some(),"months":c.query_row("SELECT months FROM chat_login_policy WHERE user=?",[&u.id],|r|r.get::<_,i64>(0)).optional()?.unwrap_or(12),"preferences":c.query_row("SELECT body FROM chat_preferences WHERE user=?",[&u.id],|r|r.get::<_,String>(0)).optional()?.unwrap_or_default()}),
+                json!({"id":u.id,"owner":u.owner,"canInvite":u.owner || c.query_row("SELECT can_invite FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"canSpace":u.owner || c.query_row("SELECT can_space FROM chat_users WHERE id=?",[&u.id],|r|r.get::<_,bool>(0))?,"username":name,"bundle":bundle,"identity":serde_json::from_str::<Value>(&identity).unwrap_or(Value::Null),"totp":!totp.is_empty(),"policy":setting(&c,"policy")?,"limits":{"maxUpload":effective_upload(&c,a)?},"users":directory(&c)?,"formerUsers":former_users(&c)?,"friendIds":friend_ids(&c,&u.id)?,"media":a.cfg.media.is_some(),"months":c.query_row("SELECT months FROM chat_login_policy WHERE user=?",[&u.id],|r|r.get::<_,i64>(0)).optional()?.unwrap_or(12),"preferences":c.query_row("SELECT body FROM chat_preferences WHERE user=?",[&u.id],|r|r.get::<_,String>(0)).optional()?.unwrap_or_default()}),
             )
         }
         "logout" => {
@@ -1153,14 +1181,13 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
         }
         "admin.storage" => {
             owner(&u)?;
-            let (max_upload, quota) = chat_limits(&c)?;
-            Ok(json!({"maxUpload":max_upload,"quota":quota,"used":chat_storage_used(&c)?}))
+            storage_view(&c, a)
         }
         "policy" => {
             owner(&u)?;
             let (old_upload, old_quota) = chat_limits(&c)?;
             let max_upload = match v.get("maxUpload") {
-                Some(value) => value.as_i64().filter(|n| (1..=MAX_CHAT_UPLOAD).contains(n)).ok_or(bad("Maximum upload must be between 1 byte and 100 GiB"))?,
+                Some(value) => value.as_i64().filter(|n| (0..=MAX_CHAT_UPLOAD).contains(n)).ok_or(bad("Use automatic file limits (0) or a maximum up to 100 GiB"))?,
                 None => old_upload,
             };
             let chat_quota = match v.get("chatQuota") {
@@ -1830,7 +1857,9 @@ fn dispatch(a: &App, h: &HeaderMap, peer: SocketAddr, addr: &str, v: Value) -> A
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             let before = v["before"].as_i64().unwrap_or(0);
-            let filter = if recent || before > 0 || v["archive"].as_bool().unwrap_or(false) {
+            let filter = if v["catalog"].as_bool().unwrap_or(false) {
+                " AND kind='emoji'"
+            } else if recent || before > 0 || v["archive"].as_bool().unwrap_or(false) {
                 " AND kind IN ('message','call','emoji')"
             } else {
                 ""
@@ -2056,6 +2085,7 @@ pub async fn begin_object(
         }
     }
     let (max_upload, _) = chat_limits(&tx)?;
+    let max_upload = if max_upload == 0 { MAX_CHAT_UPLOAD } else { max_upload };
     let encrypted_limit = max_upload + ((max_upload + BLOCK as i64 - 1) / BLOCK as i64) * 28;
     if bytes > encrypted_limit {
         return Err(bad("This file exceeds the Node's maximum upload size"));
@@ -3042,6 +3072,43 @@ mod polish_tests {
         assert!(run(&app, &owner, invalid).is_err());
         run(&app, &owner, json!({"action":"policy","title":"Renamed","signupUntil":0,"createSpaces":"owner"})).unwrap();
         assert_eq!(chat_limits(&db(&app).unwrap()).unwrap(), (MAX_CHAT_UPLOAD,5*1024i64.pow(4)));
+    }
+
+    #[test]
+    fn emoji_archive_is_paginated_and_restricted_to_conversation_members() {
+        let (_dir, app, owner, reader, _key, owner_id, _reader_id) = fixture();
+        let room=random(24);
+        let c=db(&app).unwrap();
+        c.execute("INSERT INTO chat_rooms(id,space,kind,creator,sealed,created) VALUES(?,'','group',?,'cipher',?)",params![room,owner_id,now()]).unwrap();
+        c.execute("INSERT INTO chat_members(room,user,box) VALUES(?,?,'cipher')",params![room,owner_id]).unwrap();
+        for (id,kind) in [("message","message"),("emoji","emoji"),("typing","typing")] {
+            c.execute("INSERT INTO chat_events(room,sender,device,id,kind,body,at) VALUES(?,?,'device',?,?,?,?)",params![room,owner_id,id,kind,"{}",now()]).unwrap();
+        }
+        drop(c);
+        let page=run(&app,&owner,json!({"action":"events","room":room,"catalog":true})).unwrap();
+        let events=page["events"].as_array().unwrap();assert_eq!(events.len(),1);assert_eq!(events[0]["kind"],"emoji");
+        assert!(run(&app,&owner,json!({"action":"events","room":room,"catalog":true,"after":events[0]["seq"]})).unwrap()["events"].as_array().unwrap().is_empty());
+        assert_eq!(run(&app,&reader,json!({"action":"events","room":room,"catalog":true})).unwrap_err().0,StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn automatic_upload_limits_account_for_encryption_and_available_capacity() {
+        assert_eq!(upload_limit(0, 0), 0);
+        assert_eq!(upload_limit(0, 28), 0);
+        assert_eq!(upload_limit(0, 1000), 972);
+        assert_eq!(upload_limit(1024, 1024*1024), 1024);
+        assert!(upload_limit(0, 8*MAX_CHAT_UPLOAD) <= MAX_CHAT_UPLOAD);
+        for remaining in [1, 29, 1024, BLOCK as i64, BLOCK as i64 + 1, 10*BLOCK as i64] {
+            let limit = upload_limit(0,remaining);
+            if limit > 0 {assert!(limit + ((limit+BLOCK as i64-1)/BLOCK as i64).max(1)*28 <= remaining);}
+        }
+        let (_dir, app, owner, reader, _key, _owner_id, _reader_id) = fixture();
+        run(&app,&owner,json!({"action":"policy","title":"Dynamic","signupUntil":0,"createSpaces":"owner","maxUpload":0,"chatQuota":0})).unwrap();
+        assert_eq!(chat_limits(&db(&app).unwrap()).unwrap(), (0,0));
+        let storage=run(&app,&owner,json!({"action":"admin.storage"})).unwrap();
+        assert!(storage["effectiveMaxUpload"].as_i64().unwrap() <= storage["remaining"].as_i64().unwrap());
+        assert!(storage["diskTotal"].as_u64().unwrap() >= storage["diskFree"].as_u64().unwrap());
+        assert_eq!(run(&app,&reader,json!({"action":"admin.storage"})).unwrap_err().0,StatusCode::FORBIDDEN);
     }
 
     #[test]

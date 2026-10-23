@@ -42,7 +42,7 @@ pub async fn discovery(State(a): State<App>) -> Api<Json<Value>> {
         "community":{"single_community":false,"single_community_guild_id":null,"direct_messages_disabled":false,
             "guild_create_access":policy["createSpaces"]=="everyone"},
         "services":{"gif_enabled":false,"youtube_enabled":false,"bluesky_enabled":false},
-        "limits":{"version":2,"traitDefinitions":["premium"],"rules":[{"id":"vortex-node-policy","overrides":{"max_attachment_file_size":policy["maxUpload"].as_i64().unwrap_or(100*1024i64.pow(3))}}],"defaultsHash":"vortex-v1"},
+        "limits":{"version":2,"traitDefinitions":["premium"],"rules":[{"id":"vortex-node-policy","overrides":{"max_attachment_file_size":chat::effective_upload(&c,&a)?}}],"defaultsHash":"vortex-v1"},
         "push":{"public_vapid_key":chat::push_public_key(&c)?},
         "app_public":{"branding":{"product_name":"Vortex Chat","premium_product_name":"Vortex Chat",
             "icon_url":null,"symbol_url":null,"logo_url":null,"wordmark_url":null,"favicon_url":null,

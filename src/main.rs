@@ -273,7 +273,7 @@ fn safety_floor(app: &App) -> u64 {
             0
         })
 }
-fn free_bytes(path: &Path) -> Api<u64> {
+fn disk_capacity(path: &Path) -> Api<(u64, u64)> {
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -288,7 +288,8 @@ fn free_bytes(path: &Path) -> Api<u64> {
             ));
         }
         let v = unsafe { v.assume_init() };
-        Ok((v.f_bavail as u64).saturating_mul(v.f_frsize as u64))
+        Ok(((v.f_blocks as u64).saturating_mul(v.f_frsize as u64),
+            (v.f_bavail as u64).saturating_mul(v.f_frsize as u64)))
     }
     #[cfg(not(unix))]
     {
@@ -299,7 +300,9 @@ fn free_bytes(path: &Path) -> Api<u64> {
         ))
     }
 }
-fn reserve(c: &Connection, app: &App, additional: u64) -> Api<()> {
+fn free_bytes(path: &Path) -> Api<u64> {Ok(disk_capacity(path)?.1)}
+
+fn available_bytes(c: &Connection, app: &App) -> Api<u64> {
     let a: i64 = c.query_row("SELECT COALESCE(SUM(remaining),0) FROM uploads", [], |r| {
         r.get(0)
     })?;
@@ -310,15 +313,14 @@ fn reserve(c: &Connection, app: &App, additional: u64) -> Api<()> {
         |r| r.get(0),
     )?;
     let chat_pending:i64=c.query_row("SELECT COALESCE(SUM(MAX(0,bytes-stored)),0) FROM chat_objects WHERE complete=0",[],|r|r.get(0))?;
-    if free_bytes(&app.cfg.data_dir)?
+    Ok(free_bytes(&app.cfg.data_dir)?
         .saturating_sub((a.max(0) as u64).saturating_add(b.max(0) as u64).saturating_add(jobs.max(0) as u64).saturating_add(chat_pending.max(0) as u64))
-        .saturating_sub(additional)
-        < safety_floor(app)
-    {
-        return Err(Fault(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "The Node is preserving its 10 GB free-space buffer",
-        ));
+        .saturating_sub(safety_floor(app)))
+}
+fn reserve(c: &Connection, app: &App, additional: u64) -> Api<()> {
+    if additional > available_bytes(c, app)? {
+        return Err(Fault(StatusCode::INSUFFICIENT_STORAGE,
+            "The Node is preserving its free-space buffer and pending uploads"));
     }
     Ok(())
 }
